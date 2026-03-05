@@ -380,6 +380,20 @@ class Database:
             
         cursor = self.connection.cursor()
         try:
+            # Avoid queue amplification: do not store exact duplicate pending packets.
+            dedupe_query = """
+                SELECT SerialNo
+                FROM Packet
+                WHERE Receiver = %s AND Sender = %s AND Code = %s AND Body = %s
+                ORDER BY SerialNo DESC
+                LIMIT 1
+            """
+            cursor.execute(dedupe_query, (r_no, s_no, code, body))
+            if cursor.fetchone():
+                print(f"[DEBUG] Duplicate offline packet skipped: send={s_no}, recv={r_no}, code={code}")
+                cursor.close()
+                return True
+
             query = """
                 INSERT INTO Packet (Receiver, Sender, Code, Body, Time) 
                 VALUES (%s, %s, %s, %s, NOW())

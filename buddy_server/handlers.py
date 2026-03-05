@@ -264,6 +264,10 @@ async def handle_buddy_chat(client, payload):
       UID(16) + Nick(12) + 11 C0 1F 00 + Message(40)
     """
     try:
+        if not client.is_authenticated or not client.user_id:
+            logger.warning(f"[CHAT] Ignored unauthenticated chat packet from {client.ip}")
+            return
+
         if b'\x00' not in payload:
             logger.warning("[CHAT] Invalid payload: missing target separator")
             return
@@ -349,7 +353,7 @@ async def handle_buddy_action(client, payload):
         output_payload.extend(remainder)
         
         # ========== VERIFICA TARGET ==========
-        target_session = client.server.user_sessions.get(target_id)
+        target_session = _get_session_by_user_id(client.server, target_id)
         
         if not target_session:
             logger.warning(f"[BUDDY ACTION] Target {target_id} offline ou nÃ£o encontrado")
@@ -398,9 +402,11 @@ async def handle_buddy_action(client, payload):
         logger.error(traceback.format_exc())
 
 def _get_session_by_user_id(server, user_id):
-    """Sessions are keyed by lower(UserId)."""
+    """Resolve the best live session for a user."""
     if not user_id:
         return None
+    if hasattr(server, "get_user_session"):
+        return server.get_user_session(user_id)
     return server.user_sessions.get(user_id.lower())
 
 async def _send_buddy_decision_popup(server, target_session, actor_user_id, is_accept):
@@ -436,18 +442,31 @@ async def handle_buddy_accept_reject_3000(client, reader):
         target_name = raw[:16].rstrip(b'\x00').decode('latin-1', errors='ignore').strip()
         
         # 0x3000 is ambiguous in this protocol variant: byte 0x01 appears in both paths.
-        # Only trust explicit decision bytes to avoid false-accept on reject.
+        # Prefer explicit decision bytes to avoid false-accept on reject.
         action = None
         for idx in range(16, min(len(raw), 32)):
             b = raw[idx]
             if b in (0x02, 0x03):
                 action = b
                 break
+
+        # Fallback observed in captures: marker 42 C0 01 00 XX
+        #   XX=01 -> accept, XX=00 -> reject
+        # We still only accept an explicit marker, not a generic 0x01 byte.
+        if action is None:
+            marker = b"\x42\xC0\x01\x00"
+            marker_pos = raw.find(marker)
+            if marker_pos != -1 and marker_pos + len(marker) < len(raw):
+                flag = raw[marker_pos + len(marker)]
+                if flag == 0x01:
+                    action = 0x02
+                elif flag == 0x00:
+                    action = 0x03
         
         if action is None:
             logger.info(
                 f"[0x3000] Ambiguous action for {client.user_id} -> '{target_name}' (no explicit 0x02/0x03). "
-                "Ignoring 0x3000 to avoid false accept."
+                f"Ignoring 0x3000 to avoid false accept. Raw={raw.hex().upper()}"
             )
             return
         
@@ -652,6 +671,18 @@ async def send_friend_list(client):
         buddies_raw = client.server.db.get_full_buddy_list(client.user_id)
         if not buddies_raw:
             logger.info(f"User {client.user_id} has no buddies. Sending empty 0x1011.")
+            # Explicit empty buddy-list packet. Some clients keep buddy UI inactive
+            # until they receive this plus the following sync packet.
+            empty_list = PacketBuilder(SVC_BUDDY_LIST)
+            await client.send_packet(empty_list.build())
+
+            sync_pkt = PacketBuilder(SVC_USER_SYNC)
+            sync_pkt.write_short(0x0100)
+            my_data = client.server.db.get_user_game_data(client.user_id) or {}
+            my_nick = my_data.get('NickName') or client.user_id
+            sync_pkt.write_bytes(my_nick.encode('latin-1')[:15].ljust(16, b'\x00'))
+            sync_pkt.write_bytes(binascii.unhexlify("0133bfabea000033bfabea0000"))
+            await client.send_packet(sync_pkt.build())
             return
 
         for b in buddies_raw:
@@ -688,6 +719,18 @@ async def send_friend_list(client):
                 status = client.server.status_manager.get_gunbound_status_bitmask(friend_id) if is_online else 0
                 meta = _build_meta_2021(status)
             rank_icon = int(b.get('TotalRank') or 0)
+
+            # 0. 0x1011 (SVC_BUDDY_LIST) - keep official login bootstrap semantics.
+            # Payload (32): Nick(16) + UID(12) + Status(2) + Grade(2)
+            # Some clients only enable immediate buddy actions after receiving non-empty 0x1011 entries.
+            list_pkt = PacketBuilder(SVC_BUDDY_LIST)
+            list_pkt.write_bytes(_enc_fixed(nick_val, 16))
+            list_pkt.write_bytes(_enc_fixed(friend_id, 12))
+            list_pkt.write_short(status & 0xFFFF)
+            grade_val = int(b.get('TotalGrade') or b.get('TotalRank') or 0)
+            list_pkt.write_short(grade_val & 0xFFFF)
+            await client.send_packet(list_pkt.build())
+
             add_resp.write_short(rank_icon & 0xFFFF)
             await client.send_packet(add_resp.build())
 
@@ -910,6 +953,15 @@ async def handle_login(client, reader):
     # Use canonical UserId from game table (handles lookup by NickName)
     client.user_id = game_data.get('UserId') or game_data.get('userid') or client.user_id
 
+    # Mark session authenticated as early as possible after identity is resolved.
+    # This avoids a timing window where the client is logged in but buddy actions
+    # are still blocked because sender_client.is_authenticated is False.
+    if (not client.is_authenticated) or (
+        client.server.user_sessions.get(client.user_id.lower()) is not client
+    ):
+        client.is_authenticated = True
+        client.server.register_user(client.user_id, client)
+
     ip_addr, port = client.ip
     client.server.db.login_log(client.user_id, ip_addr, port, '127.0.0.1', 8352, 0)
 
@@ -925,9 +977,6 @@ async def handle_login(client, reader):
 
     logger.info(f"Sent Buddy List (0x1011) and Sync (0x3FFF) for {client.user_id}")
 
-    client.is_authenticated = True
-    client.server.register_user(client.user_id, client)
-    
     await client.server.status_manager.user_login(client.user_id)
 
     # Deliver persisted offline packets for the main 0x1000/0x1010 login flow.
@@ -939,6 +988,10 @@ async def handle_login(client, reader):
     logger.info(f"User {client.user_id} logged in and received {len(buddy_infos)} buddies.")
 
 async def handle_add_buddy(client, reader):
+    if not client.is_authenticated or not client.user_id:
+        logger.warning(f"[0x3010] Ignored unauthenticated add-buddy packet from {client.ip}")
+        return
+
     # Packet 0x3010: Official server uses 16-byte null-padded nickname (capture Len=20).
     raw_payload = reader.data or b""
     friend_nick = ""
@@ -959,17 +1012,24 @@ async def handle_add_buddy(client, reader):
         
     logger.info(f"Targeting friend req for: '{friend_nick}'")
     
-    friend_data = client.server.db.get_user_by_nickname(friend_nick)
-    if not friend_data:
-        logger.warning(f"Add Buddy failed: Account '{friend_nick}' does not exist.")
+    target_user_id = _resolve_canonical_user_id(client.server, friend_nick)
+    if not target_user_id:
+        friend_data = client.server.db.get_user_by_nickname(friend_nick)
+        if friend_data:
+            target_user_id = friend_data.get('UserId') or friend_data.get('Id')
+
+    if not target_user_id:
+        logger.warning("Add Buddy failed: Target user id not resolved.")
         resp = PacketBuilder(SVC_ADD_BUDDY_RESP)
         resp.write_int(0)
         await client.send_packet(resp.build())
         return
 
-    target_user_id = friend_data.get('UserId') or friend_data.get('Id')
-    if not target_user_id:
-        logger.warning("Add Buddy failed: Target user id not resolved.")
+    if target_user_id.lower() == client.user_id.lower():
+        logger.warning(f"Add Buddy blocked: self-add attempt by {client.user_id} using '{friend_nick}'")
+        resp = PacketBuilder(SVC_ADD_BUDDY_RESP)
+        resp.write_int(0)
+        await client.send_packet(resp.build())
         return
 
     # Official server invitation Relay (0x2021)
@@ -978,7 +1038,9 @@ async def handle_add_buddy(client, reader):
     sender_nick = sender_data.get('NickName') or client.user_id
     
     nick_bytes = sender_nick.encode('latin-1', errors='ignore')[:15].ljust(16, b'\x00')
-    uid_bytes = _enc_fixed(client.user_id, 12)
+    # Invite popup in some clients renders this 12-byte field as display name.
+    # Use sender nickname here to avoid showing raw login id.
+    uid_bytes = _enc_fixed(sender_nick, 12)
     
     # 16 Nick + 12 UID + 13 Tag = 41 (observed)
     tag = b'\x41\xC0\x09\x00\x00\x00\x00\x00\x00\x00\x00\x00\x20'
@@ -1003,6 +1065,10 @@ async def handle_add_buddy(client, reader):
     await client.send_packet(sync.build())
 
 async def handle_remove_buddy(client, reader):
+    if not client.is_authenticated or not client.user_id:
+        logger.warning(f"[0x3002] Ignored unauthenticated remove-buddy packet from {client.ip}")
+        return
+
     # Official server: 0x3002 body = 16-byte null-padded friend id (capture Len=20: 4 header + 16 body)
     raw_payload = reader.data or b""
     friend_id = ""
@@ -1051,6 +1117,10 @@ async def handle_tunnel_packet(client, reader):
         (target_id). NÃ£o devemos depender apenas de UserNo.
     """
     try:
+        if not client.is_authenticated or not client.user_id:
+            logger.warning(f"[0x2020] Ignored unauthenticated tunnel packet from {client.ip}")
+            return
+
         raw = reader.data or b""
         if len(raw) < 4:
             logger.warning("0x2020 payload too short")
@@ -1159,7 +1229,8 @@ async def handle_tunnel_packet(client, reader):
         if len(payload_data) >= 2 and payload_data[0] == 0x01 and payload_data[1] == 0x41:
             sender_nick = (client.server.db.get_user_game_data(client.user_id) or {}).get("NickName") or client.user_id
             nick_bytes = _enc_fixed(sender_nick, 16)
-            uid_bytes = _enc_fixed(client.user_id, 12)
+            # Keep invite display consistent with 0x3010 path (nickname-first UX).
+            uid_bytes = _enc_fixed(sender_nick, 12)
             
             # Use confirmed 41-byte format for 0x2021 relay
             buddy_req_payload_2021 = nick_bytes + uid_bytes + b'\x41\xC0\x09\x00\x00\x00\x00\x00\x00\x00\x00\x00\x20'

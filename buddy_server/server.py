@@ -67,90 +67,91 @@ class ClientConnection:
 
     async def run(self):
         try:
+            wire_buffer = bytearray()
+
             while True:
-                block_data = await self.reader.read(16)
-                if not block_data:
-                    break
-                
-                logger.info(f"RAW RECEIVED ({len(block_data)} bytes): {block_data.hex().upper()}") 
-                if self.ip:
-                    tracer.log("IN", self.ip[0], self.ip[1], block_data)
-                
-                is_plaintext = False
-                raw_len = 0
-                
-                if len(block_data) >= 4:
-                    raw_len = int.from_bytes(block_data[:2], 'little')
-                    raw_id = int.from_bytes(block_data[2:4], 'little')
-                    
-                    if raw_len >= 4 and raw_len <= 8192:
-                         is_plaintext = True
-                
-                if not is_plaintext:
-                    if len(block_data) < 16:
-                        missing = 16 - len(block_data)
-                        try:
-                            more = await self.reader.readexactly(missing)
-                            block_data += more
-                            if self.ip:
-                                tracer.log("IN", self.ip[0], self.ip[1], more)
-                        except:
-                            break
-                
+                if len(wire_buffer) < 4:
+                    block_data = await self.reader.read(4096)
+                    if not block_data:
+                        break
+
+                    logger.info(f"RAW RECEIVED ({len(block_data)} bytes): {block_data.hex().upper()}")
+                    if self.ip:
+                        tracer.log("IN", self.ip[0], self.ip[1], block_data)
+                    wire_buffer.extend(block_data)
+                    continue
+
+                raw_len = int.from_bytes(wire_buffer[0:2], "little")
+                raw_id = int.from_bytes(wire_buffer[2:4], "little")
+                is_plaintext = 4 <= raw_len <= 8192
+
                 if is_plaintext:
                     packet_len = raw_len
+                    if len(wire_buffer) < packet_len:
+                        block_data = await self.reader.read(4096)
+                        if not block_data:
+                            break
+                        logger.info(f"RAW RECEIVED ({len(block_data)} bytes): {block_data.hex().upper()}")
+                        if self.ip:
+                            tracer.log("IN", self.ip[0], self.ip[1], block_data)
+                        wire_buffer.extend(block_data)
+                        continue
+
+                    packet_buf = bytes(wire_buffer[:packet_len])
+                    del wire_buffer[:packet_len]
+
                     packet_id = raw_id
-                    decrypted_block = block_data
-                else:
-                    decrypted_block = GBCrypto.decrypt(block_data, 0)
-                    packet_len = int.from_bytes(decrypted_block[:2], 'little')
-                    packet_id = int.from_bytes(decrypted_block[2:], 'little')
+                    header = packet_buf[:4]
+                    real_payload = packet_buf[4:]
+                    logger.info(f"[IN] Recv Packet {hex(packet_id)} from {self.ip} | Len: {packet_len}")
+                    await handle_packet(self, packet_id, header, real_payload)
+                    continue
+
+                # Encrypted path: need at least one full encrypted block (16 bytes).
+                if len(wire_buffer) < 16:
+                    block_data = await self.reader.read(4096)
+                    if not block_data:
+                        break
+                    logger.info(f"RAW RECEIVED ({len(block_data)} bytes): {block_data.hex().upper()}")
+                    if self.ip:
+                        tracer.log("IN", self.ip[0], self.ip[1], block_data)
+                    wire_buffer.extend(block_data)
+                    continue
+
+                decrypted_head = GBCrypto.decrypt(bytes(wire_buffer[:16]), 0)
+                packet_len = int.from_bytes(decrypted_head[:2], "little")
+                packet_id = int.from_bytes(decrypted_head[2:4], "little")
 
                 if packet_len > 4096 or packet_len < 4:
-                     logger.warning(f"Invalid Packet Length after decryption: {packet_len}. Key might be wrong.")
-                
-                remaining_data = b""
-                decrypted_remaining = b""
-                
-                if is_plaintext:
-                    # Use actual bytes received so payload in same or next TCP segment is read
-                    needed = packet_len - len(block_data)
-                    # Thor's Hammer / GBS: when we have more than 4 bytes but header says length=4,
-                    # use full received block as one packet (payload = rest of block)
-                    if needed <= 0 and packet_len == 4 and len(block_data) > 4:
-                        packet_len = len(block_data)
-                        needed = 0
-                    if needed > 0:
-                        remaining_data = await self.reader.readexactly(needed)
-                        if self.ip:
-                            tracer.log("IN", self.ip[0], self.ip[1], remaining_data)
-                    
-                else:
-                    wire_size = packet_len
-                    if wire_size % 16 != 0:
-                        wire_size = ((packet_len // 16) + 1) * 16
-                    
-                    remaining_wire = wire_size - 16
-                    
-                    if remaining_wire > 0:
-                        remaining_data = await self.reader.readexactly(remaining_wire)
-                        if self.ip:
-                             tracer.log("IN", self.ip[0], self.ip[1], remaining_data)
-                        decrypted_remaining = GBCrypto.decrypt(remaining_data, 0)
-                
-                total_buffer = decrypted_block 
-                if is_plaintext:
-                     total_buffer += remaining_data
-                elif decrypted_remaining:
-                     total_buffer += decrypted_remaining
+                    logger.warning(
+                        f"Invalid Packet Length after decryption: {packet_len}. Key might be wrong."
+                    )
+                    # Attempt stream resync on malformed encrypted frame.
+                    del wire_buffer[:1]
+                    continue
 
+                wire_size = packet_len
+                if wire_size % 16 != 0:
+                    wire_size = ((packet_len // 16) + 1) * 16
+
+                if len(wire_buffer) < wire_size:
+                    block_data = await self.reader.read(4096)
+                    if not block_data:
+                        break
+                    logger.info(f"RAW RECEIVED ({len(block_data)} bytes): {block_data.hex().upper()}")
+                    if self.ip:
+                        tracer.log("IN", self.ip[0], self.ip[1], block_data)
+                    wire_buffer.extend(block_data)
+                    continue
+
+                encrypted_packet = bytes(wire_buffer[:wire_size])
+                del wire_buffer[:wire_size]
+                total_buffer = GBCrypto.decrypt(encrypted_packet, 0)
+                header = total_buffer[:4]
                 real_payload = total_buffer[4:packet_len]
-                
-                packet = Packet(packet_id, real_payload)
-                
+
                 logger.info(f"[IN] Recv Packet {hex(packet_id)} from {self.ip} | Len: {packet_len}")
-                
-                await handle_packet(self, packet_id, decrypted_block[:4], real_payload)
+                await handle_packet(self, packet_id, header, real_payload)
 
         except asyncio.IncompleteReadError:
             logger.info(f"Connection closed by {self.ip}")
@@ -270,6 +271,41 @@ class BuddyServer:
     def register_user(self, user_id, client):
         self.user_sessions[user_id.lower()] = client
         logger.info(f"✓ User {user_id} registered active session.")
+
+    def get_user_sessions(self, user_id):
+        """
+        Return all live authenticated sessions for a user.
+        Some clients open multiple sockets; routing to only one can miss the UI socket.
+        """
+        if not user_id:
+            return []
+
+        uid_lower = user_id.lower()
+        result = []
+        seen = set()
+
+        mapped = self.user_sessions.get(uid_lower)
+        if mapped and mapped.is_authenticated and not mapped.writer.is_closing():
+            result.append(mapped)
+            seen.add(id(mapped))
+
+        for c in self.clients:
+            if id(c) in seen:
+                continue
+            if not c or not c.is_authenticated or not c.user_id:
+                continue
+            if c.user_id.lower() != uid_lower:
+                continue
+            if c.writer.is_closing():
+                continue
+            result.append(c)
+            seen.add(id(c))
+
+        return result
+
+    def get_user_session(self, user_id):
+        sessions = self.get_user_sessions(user_id)
+        return sessions[0] if sessions else None
 
     def unregister_user(self, user_id):
         uid_lower = user_id.lower()

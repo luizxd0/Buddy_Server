@@ -6,24 +6,24 @@ logger = logging.getLogger(__name__)
 
 class TunnelingManager:
     """
-    Gerenciador avançado de packet tunneling.
+    Gerenciador avanÃ§ado de packet tunneling.
     
     Funcionalidades:
-    - Encaminhamento robusto de pacotes entre usuários
-    - Suporte para múltiplos tipos de payload
-    - Validação e sanitização automática
+    - Encaminhamento robusto de pacotes entre usuÃ¡rios
+    - Suporte para mÃºltiplos tipos de payload
+    - ValidaÃ§Ã£o e sanitizaÃ§Ã£o automÃ¡tica
     - Fallback para mensagens offline
-    - Retry logic para falhas temporárias
+    - Retry logic para falhas temporÃ¡rias
     """
     
     # Tipos de pacotes que podem ser tunelados
     TUNELABLE_PACKETS = {
         0xA110: 'CHAT',           # Mensagem de chat
-        0xA200: 'BUDDY_ACTION',   # Ação de amigo
+        0xA200: 'BUDDY_ACTION',   # AÃ§Ã£o de amigo
         0x1030: 'NOTE',           # Nota/recado
         0xA300: 'GAME_INVITE',    # Convite de jogo
-        0xA400: 'FILE_TRANSFER',  # Transferência de arquivo
-        0xA510: 'STATUS_UPDATE',  # Atualização de status
+        0xA400: 'FILE_TRANSFER',  # TransferÃªncia de arquivo
+        0xA510: 'STATUS_UPDATE',  # AtualizaÃ§Ã£o de status
     }
     OFFLINE_ALLOWED_PACKETS = {
         0xA110,   # legacy chat relay format (kept for compatibility)
@@ -44,88 +44,84 @@ class TunnelingManager:
                            retry_count=0, max_retries=2):
         """
         Tunela um pacote de sender para target com retry logic.
-        
-        Args:
-            sender_client: Cliente que enviou
-            target_id: ID do destinatário
-            packet_id: ID do pacote original
-            payload: Dados do pacote
-            retry_count: Tentativas atuais
-            max_retries: Máximo de tentativas
-            
+
         Returns:
-            bool: True se enviado com sucesso ou salvo offline
+            bool: True if sent successfully or saved offline.
         """
         self.tunnel_stats['total_tunneled'] += 1
-        
-        # Validação de segurança
+
         if not self._validate_tunnel_request(sender_client, target_id, packet_id):
             logger.warning(f"Tunnel validation failed: {sender_client.user_id} -> {target_id}")
             self.tunnel_stats['failed'] += 1
             return False
-        
-        # Sanitiza payload
+
         sanitized_payload = self._sanitize_payload(packet_id, payload)
-        
-        # Tenta enviar para usuário online (user_sessions key = UserId string)
+
         target_key = (target_id or "").lower()
-        target_session = self.server.user_sessions.get(target_key)
+        if hasattr(self.server, "get_user_sessions"):
+            target_sessions = self.server.get_user_sessions(target_id)
+        else:
+            sess = self.server.user_sessions.get(target_key)
+            target_sessions = [sess] if sess else []
+
         if packet_id == 0xA200:
-            logger.info(f"[TUNNEL 0xA200] target_id={target_id!r}, session_found={target_session is not None}, payload_len={len(sanitized_payload)}")
-        
-        if target_session:
-            try:
-                # Testa se a conexão está realmente viva
-                if not await self._is_connection_alive(target_session):
-                    logger.warning(f"Target {target_id} connection is dead (zombie)")
-                    raise ConnectionError("Zombie connection detected")
-                
-                # Constrói pacote tunelado
-                tunnel_packet = self._build_tunnel_packet(
-                    sender_client.user_id, 
-                    packet_id, 
-                    sanitized_payload
-                )
-                
-                await target_session.send_packet(tunnel_packet)
-                
+            logger.info(f"[TUNNEL 0xA200] target_id={target_id!r}, session_found={bool(target_sessions)}, payload_len={len(sanitized_payload)}")
+
+        if target_sessions:
+            delivered_count = 0
+            last_error = None
+            tunnel_packet = self._build_tunnel_packet(
+                sender_client.user_id,
+                packet_id,
+                sanitized_payload,
+            )
+
+            for target_session in target_sessions:
+                try:
+                    if not await self._is_connection_alive(target_session):
+                        raise ConnectionError("Zombie connection detected")
+                    await target_session.send_packet(tunnel_packet)
+                    delivered_count += 1
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Tunnel send failed to one session: {e}")
+                    if target_key in self.server.user_sessions and self.server.user_sessions[target_key] is target_session:
+                        del self.server.user_sessions[target_key]
+                        logger.info(f"Removed zombie session mapping: {target_id}")
+
+            if delivered_count > 0:
                 self.tunnel_stats['successful'] += 1
-                logger.info(f"[TUNNEL] {sender_client.user_id} -> {target_id} (0x{packet_id:04X}) ✓")
+                logger.info(f"[TUNNEL] {sender_client.user_id} -> {target_id} (0x{packet_id:04X}) success sessions={delivered_count}")
                 if packet_id == 0xA200:
                     raw = tunnel_packet.to_bytes()
                     logger.info(f"[TUNNEL 0xA200] sent hex (first 64): {raw[:64].hex().upper()}")
-                
                 return True
-                
-            except Exception as e:
-                logger.warning(f"Tunnel send failed: {e}")
-                
-                # Remove sessão zumbi
-                if target_key in self.server.user_sessions:
-                    del self.server.user_sessions[target_key]
-                    logger.info(f"Removed zombie session: {target_id}")
-                
-                # Retry logic
-                if retry_count < max_retries:
-                    self.tunnel_stats['retries'] += 1
-                    logger.info(f"Retrying tunnel (attempt {retry_count + 1}/{max_retries})...")
-                    import asyncio
-                    await asyncio.sleep(0.5)
-                    return await self.tunnel_packet(
-                        sender_client, target_id, packet_id, 
-                        payload, retry_count + 1, max_retries
-                    )
-        
+
+            if last_error is not None:
+                logger.warning(f"Tunnel send failed for all sessions: {last_error}")
+            if retry_count < max_retries:
+                self.tunnel_stats['retries'] += 1
+                logger.info(f"Retrying tunnel (attempt {retry_count + 1}/{max_retries})...")
+                import asyncio
+                await asyncio.sleep(0.5)
+                return await self.tunnel_packet(
+                    sender_client,
+                    target_id,
+                    packet_id,
+                    payload,
+                    retry_count + 1,
+                    max_retries,
+                )
+
         if packet_id == 0xA200:
             logger.info(f"[TUNNEL 0xA200] Target {target_id} offline, skipping DB storage.")
             return False
 
-        # Usuário offline ou todas tentativas falharam - salva no banco
         return await self._save_offline_tunnel(
-            sender_client.user_id, 
-            target_id, 
-            packet_id, 
-            sanitized_payload
+            sender_client.user_id,
+            target_id,
+            packet_id,
+            sanitized_payload,
         )
 
     async def send_buddy_request_to_client(self, sender_client, target_id, payload, allow_offline_store=False):
@@ -133,45 +129,75 @@ class TunnelingManager:
         Send the official-format buddy relay (0x2021) to the target.
         Handles both invitation (41b payload / 45b packet) and status update (56b payload / 60b packet).
         """
-        if not sender_client.is_authenticated or sender_client.user_id == target_id:
+        if not sender_client.is_authenticated:
+            logger.warning(f"[0x2021] blocked: sender not authenticated ({getattr(sender_client, 'ip', None)}) -> {target_id}")
             return False
-            
+        if sender_client.user_id == target_id:
+            logger.warning(f"[0x2021] blocked: self-target ({sender_client.user_id})")
+            return False
+
         target_key = (target_id or "").lower()
-        target_session = self.server.user_sessions.get(target_key)
-        if not target_session:
+        if hasattr(self.server, "get_user_sessions"):
+            target_sessions = self.server.get_user_sessions(target_id)
+        else:
+            sess = self.server.user_sessions.get(target_key)
+            target_sessions = [sess] if sess else []
+
+        if not target_sessions:
+            logger.warning(f"[0x2021] target has no live session: {target_id} (allow_offline_store={allow_offline_store})")
             if allow_offline_store:
                 return await self._save_offline_tunnel(
                     sender_client.user_id, target_id, 0x2021, payload
                 )
             return False
 
-        try:
-            out_pkt = PacketBuilder(SVC_RELAY_BUDDY_REQ)
-            out_pkt.write_bytes(payload)
-            
-            await target_session.send_packet(out_pkt.build())
+        sent = 0
+        last_error = None
+        out_pkt = PacketBuilder(SVC_RELAY_BUDDY_REQ)
+        out_pkt.write_bytes(payload)
+        built = out_pkt.build()
+
+        for target_session in target_sessions:
+            try:
+                if not await self._is_connection_alive(target_session):
+                    raise ConnectionError("Zombie connection detected")
+                await target_session.send_packet(built)
+                sent += 1
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[0x2021] Send failed to one session: {e}")
+                if target_key in self.server.user_sessions and self.server.user_sessions[target_key] is target_session:
+                    del self.server.user_sessions[target_key]
+
+        if sent > 0:
             self.tunnel_stats['successful'] += 1
-            logger.info(f"[0x2021] Buddy relay ({len(payload)}b) relayed: {sender_client.user_id} -> {target_id} ✓")
+            logger.info(f"[0x2021] Buddy relay ({len(payload)}b) relayed: {sender_client.user_id} -> {target_id} success sessions={sent}")
             return True
-        except Exception as e:
-            logger.warning(f"[0x2021] Send failed: {e}")
-            return False
+
+        if allow_offline_store:
+            return await self._save_offline_tunnel(
+                sender_client.user_id, target_id, 0x2021, payload
+            )
+
+        if last_error:
+            logger.warning(f"[0x2021] Send failed for all sessions: {last_error}")
+        return False
 
     def _validate_tunnel_request(self, sender_client, target_id, packet_id):
         """
-        Valida se o tunelamento é permitido.
+        Valida se o tunelamento Ã© permitido.
         """
-        # Verificar autenticação
+        # Verificar autenticaÃ§Ã£o
         if not sender_client.is_authenticated:
             logger.warning(f"Unauthenticated tunnel attempt from {sender_client.ip}")
             return False
         
-        # Verificar se sender não está tentando enviar para si mesmo
+        # Verificar se sender nÃ£o estÃ¡ tentando enviar para si mesmo
         if sender_client.user_id == target_id:
             logger.debug(f"Self-tunnel blocked: {sender_client.user_id}")
             return False
         
-        # Verificar se o packet type é tunelável
+        # Verificar se o packet type Ã© tunelÃ¡vel
         if packet_id not in self.TUNELABLE_PACKETS:
             logger.warning(f"Non-tunelable packet type: 0x{packet_id:04X}")
             return False
@@ -220,7 +246,7 @@ class TunnelingManager:
             return payload
     
     def _build_tunnel_packet(self, sender_id, original_packet_id, payload):
-        """Constrói pacote tunelado para envio."""
+        """ConstrÃ³i pacote tunelado para envio."""
         tunnel_pkt = PacketBuilder(original_packet_id)
         # In Gunbound, tunneled packets (relays) often use Null-terminated names.
         # Pascal strings (write_string) cause issues if they contain \0 in the length prefix.
@@ -230,7 +256,7 @@ class TunnelingManager:
         return tunnel_pkt.build()
     
     async def _is_connection_alive(self, client_session):
-        """Testa se a conexão do cliente está realmente viva."""
+        """Testa se a conexÃ£o do cliente estÃ¡ realmente viva."""
         try:
             if client_session.writer.is_closing():
                 return False
@@ -270,7 +296,7 @@ class TunnelingManager:
             return False
     
     async def deliver_offline_tunnels(self, client):
-        """Entrega pacotes tunelados salvos quando usuário loga."""
+        """Entrega pacotes tunelados salvos quando usuÃ¡rio loga."""
         user_id = client.user_id
         offline_packets = self.server.db.get_packets(user_id)
         
@@ -283,12 +309,20 @@ class TunnelingManager:
         await asyncio.sleep(1.0)
         
         sender_cache = set()
+        delivered_keys = set()
         
         for pkt_data in offline_packets:
             try:
                 sender = pkt_data.get('Sender', 'Unknown')
                 packet_id = pkt_data.get('Code', 0xA110)
                 body_hex = pkt_data['Body']
+                dedupe_key = (sender, int(packet_id), body_hex)
+
+                if dedupe_key in delivered_keys:
+                    # Remove duplicate queue entries while draining.
+                    self.server.db.delete_packet(pkt_data['SerialNo'])
+                    continue
+                delivered_keys.add(dedupe_key)
                 
                 if sender != 'Unknown' and sender not in sender_cache:
                     await self._send_fake_online(client, sender)
@@ -324,7 +358,7 @@ class TunnelingManager:
         logger.info(f"[TUNNEL DELIVERY] Completed for {user_id}")
     
     async def _send_fake_online(self, client, user_id):
-        """Envia notificação fake de online."""
+        """Envia notificaÃ§Ã£o fake de online."""
         try:
             nick = user_id
             info = self.server.db.get_users_info([user_id])
@@ -345,7 +379,7 @@ class TunnelingManager:
             logger.error(f"Error sending fake online: {e}")
     
     def get_stats(self):
-        """Retorna estatísticas de tunneling"""
+        """Retorna estatÃ­sticas de tunneling"""
         success_rate = 0
         if self.tunnel_stats['total_tunneled'] > 0:
             success_rate = (self.tunnel_stats['successful'] / 
@@ -357,7 +391,7 @@ class TunnelingManager:
         }
     
     def reset_stats(self):
-        """Reseta estatísticas"""
+        """Reseta estatÃ­sticas"""
         self.tunnel_stats = {
             'total_tunneled': 0,
             'successful': 0,
