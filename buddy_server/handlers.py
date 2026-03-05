@@ -11,6 +11,69 @@ from .config import Config
 
 logger = logging.getLogger(__name__)
 
+META_2021_TEMPLATE = binascii.unhexlify("51c0180012004e00a800810d0000ffff0000c4020030000024000000")
+
+def _enc_fixed(value, size):
+    return value.encode('latin-1', errors='ignore')[:size].ljust(size, b'\x00')
+
+def _build_meta_2021(status):
+    """
+    Fallback 0x2021 metadata (28 bytes). Real clients send richer meta in 0x2020 status
+    updates; when available we cache and reuse those exact bytes.
+    """
+    meta = bytearray(META_2021_TEMPLATE)
+    struct.pack_into('<H', meta, 4, status & 0xFFFF)
+    return bytes(meta)
+
+
+def _meta_with_status(meta, status):
+    m = bytearray(meta)
+    struct.pack_into('<H', m, 4, status & 0xFFFF)
+    return bytes(m)
+
+
+def _get_cached_meta_2021(server, user_id):
+    sm = getattr(server, "status_manager", None)
+    if not sm:
+        return None
+    try:
+        data = sm.get_status_data(user_id) or {}
+    except Exception:
+        return None
+    meta = data.get("meta_2021")
+    if isinstance(meta, (bytes, bytearray)) and len(meta) == 28:
+        return bytes(meta)
+    return None
+
+
+def _cache_meta_2021(server, user_id, meta):
+    if not isinstance(meta, (bytes, bytearray)) or len(meta) != 28:
+        return
+    sm = getattr(server, "status_manager", None)
+    if not sm:
+        return
+    if user_id not in sm.user_status_data:
+        sm.user_status_data[user_id] = {}
+    sm.user_status_data[user_id]["meta_2021"] = bytes(meta)
+
+
+def _resolve_canonical_user_id(server, raw_id):
+    if not raw_id:
+        return ""
+    candidate = raw_id.strip()
+    if not candidate:
+        return ""
+
+    data = server.db.get_user_game_data(candidate) or server.db.get_user_by_nickname(candidate)
+    if data:
+        return data.get("UserId") or data.get("Id") or candidate
+
+    for uid in server.user_sessions.keys():
+        if uid.lower() == candidate.lower():
+            return uid
+
+    return candidate
+
 async def handle_packet(client, packet_id, header, payload):
     reader = PacketReader(payload)
     
@@ -413,14 +476,14 @@ def _get_session_by_user_id(server, user_id):
 async def _send_buddy_decision_popup(server, target_session, actor_user_id, is_accept):
     """
     Send legacy short 0x2021 decision event expected by the requester UI:
-    UID(12) + Nick(16) + Marker(5), where marker is:
+    UID(16) + Nick(12) + Marker(5), where marker is:
       - accept: 42 C0 01 00 01
       - reject: 42 C0 01 00 00
     (based on fresh captures in packets_add_and_accept/reject).
     """
     actor_data = server.db.get_user_game_data(actor_user_id) or {}
-    actor_uid = actor_user_id.encode('latin-1', errors='ignore')[:11].ljust(12, b'\x00')
-    actor_nick = (actor_data.get('NickName') or actor_user_id).encode('latin-1', errors='ignore')[:15].ljust(16, b'\x00')
+    actor_uid = _enc_fixed(actor_user_id, 16)
+    actor_nick = _enc_fixed(actor_data.get('NickName') or actor_user_id, 12)
     marker = b'\x42\xC0\x01\x00\x01' if is_accept else b'\x42\xC0\x01\x00\x00'
 
     evt = PacketBuilder(SVC_RELAY_BUDDY_REQ)
@@ -486,15 +549,12 @@ async def handle_buddy_accept_reject_3000(client, reader):
             my_game_data = client.server.db.get_user_game_data(client.user_id) or {}
             my_nick = my_game_data.get('NickName') or client.user_id
             my_guild = my_game_data.get('Guild') or ""
-            my_user_no = my_game_data.get('UserNo') or 0
-            my_rank = int(my_game_data.get('TotalGrade') or 0)
             
             # Standard Acceptance Relay (60 bytes total / 56 bytes payload)
-            # Layout: UID(16) + Nick(16) + Metadata(24)
-            uid_b = client.user_id.encode('latin-1')[:15].ljust(16, b'\x00')
-            nick_b_16 = my_nick.encode('latin-1')[:15].ljust(16, b'\x00')
-            nick_b_14 = my_nick.encode('latin-1')[:13].ljust(14, b'\x00')
-            guild_b = my_guild.encode('latin-1')[:7].ljust(8, b'\x00')
+            # Layout: UID(16) + Nick(12) + Metadata(28)
+            uid_b = _enc_fixed(client.user_id, 16)
+            nick_b_12 = _enc_fixed(my_nick, 12)
+            guild_b = _enc_fixed(my_guild, 8)
             
             if is_accept:
                 # Ensure requester gets the same accept popup used in 0x2020 accept path.
@@ -505,16 +565,12 @@ async def handle_buddy_accept_reject_3000(client, reader):
                     is_accept=True,
                 )
 
-                # Base Metadata block for `0x2021` (24 bytes)
-                meta = bytearray(binascii.unhexlify("41c0180012004e00a800810d0000ffff0000c4020030000024000000")[:24])
-                # Acceptance 
-                struct.pack_into('<H', meta, 4, 0x0012) # Online status
-                struct.pack_into('<H', meta, 18, my_user_no & 0xFFFF)
-                struct.pack_into('<H', meta, 20, my_rank)
+                cached_meta = _get_cached_meta_2021(client.server, client.user_id)
+                meta = cached_meta if cached_meta else _build_meta_2021(0x0012)
                 evt = PacketBuilder(SVC_RELAY_BUDDY_REQ)
                 evt.write_bytes(uid_b)
-                evt.write_bytes(nick_b_16)
-                evt.write_bytes(bytes(meta))
+                evt.write_bytes(nick_b_12)
+                evt.write_bytes(meta)
                 await sender_session.send_packet(evt.build())
             else:
                 await _send_buddy_decision_popup(
@@ -526,15 +582,13 @@ async def handle_buddy_accept_reject_3000(client, reader):
             
             if is_accept:
                 # Also send the 0x3001 packet to ensure it appears in the list immediately
-                status = 0x0012
+                rank_icon = int(my_game_data.get('TotalRank') or 0)
                 add_resp = PacketBuilder(SVC_ADD_BUDDY_RESP)
                 add_resp.write_short(0)
                 add_resp.write_bytes(uid_b)
-                add_resp.write_bytes(nick_b_14)
+                add_resp.write_bytes(nick_b_12)
                 add_resp.write_bytes(guild_b)
-                add_resp.write_short(my_user_no & 0xFFFF)
-                add_resp.write_short(status)
-                add_resp.write_short(my_rank)
+                add_resp.write_short(rank_icon & 0xFFFF)
                 await sender_session.send_packet(add_resp.build())
                 
                 await send_friend_list(sender_session)
@@ -678,47 +732,47 @@ async def send_friend_list(client):
                 continue
 
             is_online = (friend_id.lower() in client.server.user_sessions)
-            status = client.server.status_manager.get_gunbound_status_bitmask(friend_id)
-            rank = int(b.get('TotalGrade') or 0)
-            user_no = int(b.get('UserNo') or 0)
             guild_name = b.get('Guild') or ""
             
             nick_val = b.get('NickName') or friend_id
-            uid_b = friend_id.encode('latin-1', errors='ignore')[:15].ljust(16, b'\x00')
-            nick_b_16 = nick_val.encode('latin-1', errors='ignore')[:15].ljust(16, b'\x00')
-            nick_b_14 = nick_val.encode('latin-1', errors='ignore')[:13].ljust(14, b'\x00')
-            guild_b = guild_name.encode('latin-1', errors='ignore')[:7].ljust(8, b'\x00')
+            uid_b = _enc_fixed(friend_id, 16)
+            nick_b_12 = _enc_fixed(nick_val, 12)
+            guild_b = _enc_fixed(guild_name, 8)
 
-            # 1. 0x3001 (SVC_ADD_BUDDY_RESP) - Length varies, around 52 bytes total depending on version
-            # Layout from v20: Prefix(2) + UID(16) + Nick(16) + Guild(8) + UserNo(2) + Status(2) + Rank(2)
+            # 1. 0x3001 (SVC_ADD_BUDDY_RESP) - 44 bytes total (4 header + 40 payload)
+            # Layout observed: Prefix(2) + UID(16) + Nick(12) + Guild(8) + RankIcon(2)
             add_resp = PacketBuilder(SVC_ADD_BUDDY_RESP)
             add_resp.write_short(0)
             add_resp.write_bytes(uid_b)
-            add_resp.write_bytes(nick_b_14)
-            add_resp.write_bytes(guild_b)         # 34
-            add_resp.write_short(user_no & 0xFFFF) # 42
-            add_resp.write_short(status)          # 44
-            add_resp.write_short(rank)            # 46
+            add_resp.write_bytes(nick_b_12)
+            add_resp.write_bytes(guild_b)
+            cached_meta = _get_cached_meta_2021(client.server, friend_id)
+            if cached_meta:
+                if is_online:
+                    meta = cached_meta
+                    status = struct.unpack_from('<H', cached_meta, 4)[0]
+                else:
+                    status = 0
+                    meta = _meta_with_status(cached_meta, 0)
+            else:
+                status = client.server.status_manager.get_gunbound_status_bitmask(friend_id) if is_online else 0
+                meta = _build_meta_2021(status)
+            rank_icon = int(b.get('TotalRank') or 0)
+            add_resp.write_short(rank_icon & 0xFFFF)
             await client.send_packet(add_resp.build())
 
             # 2. 0x2021 (SVC_RELAY_BUDDY_REQ) - 60 bytes total (4 header + 56 payload)
-            # Alignment v20: UID(16) + Nick(16) + Metadata(24)
-            # Metadata: [4-5] Status, [18-19] UserNo, [20-21] Rank
-            # Guild name at metadata offset 0 (relative offset 32)
-            meta = bytearray(24)
-            struct.pack_into('<H', meta, 4, status)
-            struct.pack_into('<H', meta, 18, user_no & 0xFFFF)
-            struct.pack_into('<H', meta, 20, rank)
+            # Observed layout: UID(16) + Nick(12) + Meta(28)
             
             relay_upd = PacketBuilder(SVC_RELAY_BUDDY_REQ)
             relay_upd.write_bytes(uid_b)
-            relay_upd.write_bytes(nick_b_16)
-            relay_upd.write_bytes(bytes(meta))
+            relay_upd.write_bytes(nick_b_12)
+            relay_upd.write_bytes(meta)
             
             final_pkt = relay_upd.build()
             await client.send_packet(final_pkt)
             
-            logger.info(f"Relayed Buddy Info (0x2021) v20: UID={friend_id}, Nick={nick_val}, Guild='{guild_name}', Rank={rank}, Online={is_online}, Status={status}")
+            logger.info(f"Relayed Buddy Info (0x2021) v20: UID={friend_id}, Nick={nick_val}, Guild='{guild_name}', Online={is_online}, Status={status}")
             logger.debug(f"[0x2021 HEX] {final_pkt.to_bytes().hex().upper()}")
         
         # Followed by 35-byte Sync (0x3FFF)
@@ -988,10 +1042,10 @@ async def handle_add_buddy(client, reader):
     sender_nick = sender_data.get('NickName') or client.user_id
     
     nick_bytes = sender_nick.encode('latin-1', errors='ignore')[:15].ljust(16, b'\x00')
-    uid_bytes = client.user_id.encode('latin-1', errors='ignore')[:15].ljust(16, b'\x00')
+    uid_bytes = _enc_fixed(client.user_id, 12)
     
-    # 16 Nick + 16 UID + 9 Tag = 41
-    tag = b'\x41\xC0\x09\x00\x00\x00\x00\x00\x20'
+    # 16 Nick + 12 UID + 13 Tag = 41 (observed)
+    tag = b'\x41\xC0\x09\x00\x00\x00\x00\x00\x00\x00\x00\x00\x20'
     buddy_req_payload_2021 = nick_bytes + uid_bytes + tag
 
     logger.info(f"Relaying Buddy Invitation: {client.user_id}({sender_nick}) -> {target_user_id}. Hex: {buddy_req_payload_2021.hex()}")
@@ -1086,15 +1140,41 @@ async def handle_tunnel_packet(client, reader):
             logger.warning("Tunnel failed: Could not resolve target from 0x2020 payload")
             return
 
+        # Normalize to canonical UserId (fixes case/nickname variants like Test2/test2).
+        target_id = _resolve_canonical_user_id(client.server, target_id)
+        if not target_id:
+            logger.warning("Tunnel failed: target could not be canonicalized")
+            return
+
         # payload_data = tudo exceto o nickname de 16 bytes no final
         payload_data = raw[:-16]
+
+        # Status relay payload from client:
+        # 0x2020 body = 00 + meta28 + 01 00 + target16
+        # Relay as 0x2021 full: UID16 + Nick12 + meta28.
+        if len(payload_data) == 31 and payload_data[0] == 0x00 and payload_data[29:31] == b'\x01\x00':
+            meta = payload_data[1:29]
+            _cache_meta_2021(client.server, client.user_id, meta)
+
+            sender_data = client.server.db.get_user_game_data(client.user_id) or {}
+            sender_nick = sender_data.get("NickName") or client.user_id
+            relay_payload = _enc_fixed(client.user_id, 16) + _enc_fixed(sender_nick, 12) + meta
+
+            ok = await client.server.tunneling_manager.send_buddy_request_to_client(
+                client, target_id, relay_payload
+            )
+            if ok:
+                logger.info(f"[0x2020] Status relay as 0x2021: {client.user_id} -> {target_id}")
+            else:
+                logger.warning(f"[0x2020] Status relay failed: {client.user_id} -> {target_id}")
+            return
 
         # Buddy REQUEST via tunnel (0x01 0x41): client wants to add target.
         # Official server relays this as 0x2021 with 41-byte payload.
         if len(payload_data) >= 2 and payload_data[0] == 0x01 and payload_data[1] == 0x41:
             sender_nick = (client.server.db.get_user_game_data(client.user_id) or {}).get("NickName") or client.user_id
-            nick_bytes = sender_nick.encode('latin-1', errors='ignore')[:15].ljust(16, b'\x00')
-            uid_bytes = client.user_id.encode('latin-1', errors='ignore')[:11].ljust(12, b'\x00')
+            nick_bytes = _enc_fixed(sender_nick, 16)
+            uid_bytes = _enc_fixed(client.user_id, 12)
             
             # Use confirmed 41-byte format for 0x2021 relay
             buddy_req_payload_2021 = nick_bytes + uid_bytes + b'\x41\xC0\x09\x00\x00\x00\x00\x00\x00\x00\x00\x00\x20'
@@ -1153,12 +1233,13 @@ async def handle_tunnel_packet(client, reader):
             
             if target_session:
                 # Standard 60-byte Acceptance Notification
-                nick_b = my_nick.encode('latin-1')[:15].ljust(16, b'\x00')
-                uid_b = client.user_id.encode('latin-1')[:15].ljust(16, b'\x00')
-                meta = binascii.unhexlify("41c0180012004e00a800810d0000ffff0000c4020030000024000000")[:24]
+                nick_b = _enc_fixed(my_nick, 12)
+                uid_b = _enc_fixed(client.user_id, 16)
+                cached_meta = _get_cached_meta_2021(client.server, client.user_id)
+                meta = cached_meta if cached_meta else _build_meta_2021(0x0012)
                 
                 out = PacketBuilder(SVC_RELAY_BUDDY_REQ)
-                out.write_bytes(nick_b + uid_b + meta)
+                out.write_bytes(uid_b + nick_b + meta)
                 await target_session.send_packet(out.build())
                 
                 await send_friend_list(target_session)

@@ -65,7 +65,8 @@ class TunnelingManager:
         sanitized_payload = self._sanitize_payload(packet_id, payload)
         
         # Tenta enviar para usuário online (user_sessions key = UserId string)
-        target_session = self.server.user_sessions.get(target_id)
+        target_key = (target_id or "").lower()
+        target_session = self.server.user_sessions.get(target_key)
         if packet_id == 0xA200:
             logger.info(f"[TUNNEL 0xA200] target_id={target_id!r}, session_found={target_session is not None}, payload_len={len(sanitized_payload)}")
         
@@ -97,8 +98,8 @@ class TunnelingManager:
                 logger.warning(f"Tunnel send failed: {e}")
                 
                 # Remove sessão zumbi
-                if target_id in self.server.user_sessions:
-                    del self.server.user_sessions[target_id]
+                if target_key in self.server.user_sessions:
+                    del self.server.user_sessions[target_key]
                     logger.info(f"Removed zombie session: {target_id}")
                 
                 # Retry logic
@@ -132,7 +133,8 @@ class TunnelingManager:
         if not sender_client.is_authenticated or sender_client.user_id == target_id:
             return False
             
-        target_session = self.server.user_sessions.get(target_id)
+        target_key = (target_id or "").lower()
+        target_session = self.server.user_sessions.get(target_key)
         if not target_session:
             # Save for offline delivery
             return await self._save_offline_tunnel(

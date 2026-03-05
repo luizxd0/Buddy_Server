@@ -11,6 +11,22 @@ from .constants import *
 
 logger = logging.getLogger(__name__)
 
+META_2021_TEMPLATE = binascii.unhexlify("51c0180012004e00a800810d0000ffff0000c4020030000024000000")
+
+def _enc_fixed(value: str, size: int) -> bytes:
+    return value.encode('latin-1', errors='ignore')[:size].ljust(size, b'\x00')
+
+def _build_meta_2021(status: int) -> bytes:
+    meta = bytearray(META_2021_TEMPLATE)
+    struct.pack_into('<H', meta, 4, status & 0xFFFF)
+    return bytes(meta)
+
+
+def _meta_with_status(meta: bytes, status: int) -> bytes:
+    m = bytearray(meta)
+    struct.pack_into('<H', m, 4, status & 0xFFFF)
+    return bytes(m)
+
 class UserStatus(IntEnum):
     """Estados possíveis de um usuário"""
     OFFLINE = 0
@@ -263,29 +279,32 @@ class UserStatusManager:
             if friend_session:
                 try:
                     # 0x2021 (SVC_RELAY_BUDDY_REQ) - 60 bytes total
-                    # Layout: Nick(16) + Nick(16) + UserNo(4) + Status(2) + Rank(2) + MetaPad(16)
+                    # Layout observed: UID(16) + Nick(12) + Meta(28)
                     buddy_data = self.server.db.get_user_game_data(user_id) or {}
                     nick_val = buddy_data.get('NickName') or user_id
                     
-                    status = self.get_gunbound_status_bitmask(user_id)
-                    rank = int(buddy_data.get('TotalGrade') or 0)
-                    user_no = int(buddy_data.get('UserNo') or 0)
                     guild_name = buddy_data.get('Guild') or ""
 
-                    uid_b = user_id.encode('latin-1', errors='ignore')[:15].ljust(16, b'\x00')
-                    nick_b = nick_val.encode('latin-1', errors='ignore')[:15].ljust(16, b'\x00')
-                    guild_b = guild_name.encode('latin-1', errors='ignore')[:7].ljust(8, b'\x00')
-
-                    # Metadata 24 bytes (index 4=Status, index 18=UserNo, index 20=Rank)
-                    meta = bytearray(24)
-                    struct.pack_into('<H', meta, 4, status)
-                    struct.pack_into('<H', meta, 18, user_no & 0xFFFF)
-                    struct.pack_into('<H', meta, 20, rank)
+                    uid_b = _enc_fixed(user_id, 16)
+                    nick_b = _enc_fixed(nick_val, 12)
+                    cached_meta = (self.user_status_data.get(user_id) or {}).get("meta_2021")
+                    if isinstance(cached_meta, (bytes, bytearray)) and len(cached_meta) == 28:
+                        if new_status == UserStatus.OFFLINE:
+                            status = 0
+                            meta = _meta_with_status(bytes(cached_meta), 0)
+                        else:
+                            meta = bytes(cached_meta)
+                            status = struct.unpack_from('<H', meta, 4)[0]
+                    else:
+                        status = self.get_gunbound_status_bitmask(user_id)
+                        if new_status == UserStatus.OFFLINE:
+                            status = 0
+                        meta = _build_meta_2021(status)
 
                     relay_upd = PacketBuilder(SVC_RELAY_BUDDY_REQ)
                     relay_upd.write_bytes(uid_b)
                     relay_upd.write_bytes(nick_b)
-                    relay_upd.write_bytes(bytes(meta))
+                    relay_upd.write_bytes(meta)
                     
                     await friend_session.send_packet(relay_upd.build())
                     
