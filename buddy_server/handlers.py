@@ -1039,7 +1039,16 @@ async def handle_login(client, reader):
     logger.info(f"Login request for user {user_id_req}")
     client.user_id = user_id_req
 
-    game_data = client.server.db.get_user_game_data(client.user_id)
+    # Transient DB/network hiccups during login can briefly return no row.
+    # Retry a few times before rejecting the login.
+    import asyncio
+    game_data = None
+    for attempt in range(3):
+        game_data = client.server.db.get_user_game_data(client.user_id)
+        if game_data:
+            break
+        if attempt < 2:
+            await asyncio.sleep(0.12)
     if not game_data:
         logger.warning(
             "User %r not found in Game table (UserId/NickName). Rejecting login. Payload len=%d hex=%s",
@@ -1086,7 +1095,6 @@ async def handle_login(client, reader):
 
     # Deliver persisted offline packets for the main 0x1000/0x1010 login flow.
     # Previously this was only done in handle_buddy_login().
-    import asyncio
     await asyncio.sleep(1.0)
     await client.server.tunneling_manager.deliver_offline_tunnels(client)
     

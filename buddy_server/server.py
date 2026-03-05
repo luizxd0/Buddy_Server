@@ -162,20 +162,25 @@ class ClientConnection:
 
     async def disconnect(self):
         logger.info(f"Disconnecting {self.ip}")
-        
-        if self.user_id and self.is_authenticated:
-            try:
-                await self.server.status_manager.user_logout(self.user_id)
-            except Exception as e:
-                logger.error(f"Error updating status on disconnect: {e}")
-            
-        
+
+        auth_user = self.user_id if (self.user_id and self.is_authenticated) else None
+
         try:
             self.writer.close()
             await self.writer.wait_closed()
         except:
             pass
         self.server.remove_client(self)
+
+        # Only broadcast/logout when this was the last live authenticated session.
+        if auth_user:
+            try:
+                if not self.server.get_user_sessions(auth_user):
+                    await self.server.status_manager.user_logout(auth_user)
+                else:
+                    logger.debug(f"Skip logout for {auth_user}: another active session exists")
+            except Exception as e:
+                logger.error(f"Error updating status on disconnect: {e}")
 
 class BuddyServer:
     def __init__(self, host=Config.HOST, port=Config.PORT):
@@ -307,18 +312,23 @@ class BuddyServer:
         sessions = self.get_user_sessions(user_id)
         return sessions[0] if sessions else None
 
-    def unregister_user(self, user_id):
+    def unregister_user(self, user_id, client=None):
         uid_lower = user_id.lower()
-        if uid_lower in self.user_sessions:
-            del self.user_sessions[uid_lower]
-            logger.info(f"✗ User {user_id} session unregistered.")
+        mapped = self.user_sessions.get(uid_lower)
+        if not mapped:
+            return
+        # Prevent stale socket disconnect from removing a newer active mapping.
+        if client is not None and mapped is not client:
+            logger.debug(f"Skip unregister for {user_id}: mapping points to another live client")
+            return
+        del self.user_sessions[uid_lower]
+        logger.info(f"Session unregistered for user {user_id}.")
 
     def remove_client(self, client):
         if client in self.clients:
             self.clients.remove(client)
         if client.user_id:
-            self.unregister_user(client.user_id)
-    
+            self.unregister_user(client.user_id, client)    
     # ========== MÉTODOS AUXILIARES PARA STATS ==========
     
     def get_server_stats(self):
