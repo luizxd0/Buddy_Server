@@ -74,6 +74,54 @@ def _resolve_canonical_user_id(server, raw_id):
 
     return candidate
 
+
+def _users_are_buddies(server, user_a, user_b):
+    if not user_a or not user_b:
+        return False
+    a = user_a.lower()
+    b = user_b.lower()
+    try:
+        buddies = server.db.get_full_buddy_list(user_a) or []
+        for item in buddies:
+            fid = (item.get("Id") or item.get("FriendId") or item.get("friend_id") or "").strip()
+            if fid and fid.lower() == b:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _mark_recent_buddy_removal(server, user_a, user_b):
+    if not user_a or not user_b:
+        return
+    cache = getattr(server, "recent_buddy_removals", None)
+    if cache is None:
+        cache = {}
+        setattr(server, "recent_buddy_removals", cache)
+    key = tuple(sorted((user_a.lower(), user_b.lower())))
+    now = time.time()
+    cache[key] = now
+    # Keep cache tiny and fresh.
+    for k, ts in list(cache.items()):
+        if now - ts > 15.0:
+            del cache[k]
+
+
+def _was_recent_buddy_removal(server, user_a, user_b, window_seconds=8.0):
+    if not user_a or not user_b:
+        return False
+    cache = getattr(server, "recent_buddy_removals", None)
+    if not cache:
+        return False
+    key = tuple(sorted((user_a.lower(), user_b.lower())))
+    ts = cache.get(key)
+    if ts is None:
+        return False
+    if time.time() - ts <= window_seconds:
+        return True
+    del cache[key]
+    return False
+
 async def handle_packet(client, packet_id, header, payload):
     reader = PacketReader(payload)
     
@@ -881,6 +929,12 @@ async def handle_login(client, reader):
     client.server.register_user(client.user_id, client)
     
     await client.server.status_manager.user_login(client.user_id)
+
+    # Deliver persisted offline packets for the main 0x1000/0x1010 login flow.
+    # Previously this was only done in handle_buddy_login().
+    import asyncio
+    await asyncio.sleep(1.0)
+    await client.server.tunneling_manager.deliver_offline_tunnels(client)
     
     logger.info(f"User {client.user_id} logged in and received {len(buddy_infos)} buddies.")
 
@@ -966,17 +1020,28 @@ async def handle_remove_buddy(client, reader):
         await client.send_packet(resp.build())
         return
 
-    success = client.server.db.remove_buddy(client.user_id, friend_id)
+    # Normalize case/nickname variants and delete both relationship rows.
+    friend_id = _resolve_canonical_user_id(client.server, friend_id) or friend_id
+    removed_a = client.server.db.remove_buddy(client.user_id, friend_id)
+    removed_b = client.server.db.remove_buddy(friend_id, client.user_id)
+    success = bool(removed_a or removed_b)
 
     resp = PacketBuilder(SVC_REMOVE_BUDDY_RESP)
     if success:
         resp.write_int(1)
         resp.write_string(friend_id)
-        logger.info(f"User {client.user_id} removed friend {friend_id}")
+        logger.info(f"Mutual buddy removed: {client.user_id} <-> {friend_id}")
+        _mark_recent_buddy_removal(client.server, client.user_id, friend_id)
     else:
         resp.write_int(0)
 
     await client.send_packet(resp.build())
+
+    # Refresh buddy list instantly for both sides.
+    await send_friend_list(client)
+    target_session = _get_session_by_user_id(client.server, friend_id)
+    if target_session:
+        await send_friend_list(target_session)
 
 async def handle_tunnel_packet(client, reader):
     """
@@ -1111,13 +1176,18 @@ async def handle_tunnel_packet(client, reader):
         # Older variant may send 01 43 ... for reject.
         is_accept = False
         is_reject = False
+        is_delete_action = False
         if len(payload_data) >= 6 and payload_data[:5] == b'\x01\x42\xC0\x01\x00':
             if payload_data[5] == 0x01:
                 is_accept = True
             elif payload_data[5] == 0x00:
                 is_reject = True
         elif len(payload_data) >= 2 and payload_data[0] == 0x01 and payload_data[1] == 0x43:
-            is_reject = True
+            # 0x43 is ambiguous in captures: can be invite-reject OR delete follow-up.
+            if _was_recent_buddy_removal(client.server, client.user_id, target_id) or _users_are_buddies(client.server, client.user_id, target_id):
+                is_delete_action = True
+            else:
+                is_reject = True
         elif len(payload_data) >= 1 and payload_data[0] == 0x42:
             # Legacy fallback (no decision flag available)
             is_accept = True
@@ -1166,6 +1236,18 @@ async def handle_tunnel_packet(client, reader):
                 await send_user_status_update(target_session, client.user_id, 0x0012)
             
             await send_friend_list(client)
+            return
+        if is_delete_action:
+            removed_a = client.server.db.remove_buddy(client.user_id, target_id)
+            removed_b = client.server.db.remove_buddy(target_id, client.user_id)
+            if removed_a or removed_b:
+                logger.info(f"[0x2020] Mutual buddy removed: {client.user_id} <-> {target_id}")
+            _mark_recent_buddy_removal(client.server, client.user_id, target_id)
+
+            await send_friend_list(client)
+            target_session = _get_session_by_user_id(client.server, target_id)
+            if target_session:
+                await send_friend_list(target_session)
             return
         if is_reject:
             logger.info(f"[0x2020] Buddy invite rejected: {client.user_id} -> {target_id}")
