@@ -11,7 +11,7 @@ from .constants import *
 
 logger = logging.getLogger(__name__)
 
-META_2021_TEMPLATE = binascii.unhexlify("51c0180012004e00a800810d0000ffff0000c4020030000024000000")
+META_2021_TEMPLATE = binascii.unhexlify("51c0180012008d02d007d300ffff0000ffff36034800000000008d02")
 
 def _enc_fixed(value: str, size: int) -> bytes:
     return value.encode('latin-1', errors='ignore')[:size].ljust(size, b'\x00')
@@ -185,7 +185,10 @@ class UserStatusManager:
     
     async def user_login(self, user_id: str):
         """Registra login de usuário"""
-        await self.set_status(user_id, UserStatus.ONLINE)
+        # Reset cached status metadata on login to avoid stale in-game state.
+        default_meta = _build_meta_2021(0x0012)
+        self.user_status_data[user_id] = {"meta_2021": default_meta}
+        await self.set_status(user_id, UserStatus.ONLINE, {"meta_2021": default_meta})
         logger.info(f"[STATUS] User {user_id} logged in -> ONLINE")
     
     async def user_logout(self, user_id: str):

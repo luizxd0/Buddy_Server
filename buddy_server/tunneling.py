@@ -1,4 +1,3 @@
-import struct
 import logging
 from .packets import PacketBuilder, PacketReader
 from .constants import SVC_TUNNEL_PACKET, SVC_RELAY_BUDDY_REQ
@@ -25,6 +24,10 @@ class TunnelingManager:
         0xA300: 'GAME_INVITE',    # Convite de jogo
         0xA400: 'FILE_TRANSFER',  # Transferência de arquivo
         0xA510: 'STATUS_UPDATE',  # Atualização de status
+    }
+    OFFLINE_ALLOWED_PACKETS = {
+        0xA110,   # legacy chat relay format (kept for compatibility)
+        0x2021,   # official buddy relay used by offline add-invite and chat notify
     }
     
     def __init__(self, server):
@@ -125,7 +128,7 @@ class TunnelingManager:
             sanitized_payload
         )
 
-    async def send_buddy_request_to_client(self, sender_client, target_id, payload):
+    async def send_buddy_request_to_client(self, sender_client, target_id, payload, allow_offline_store=False):
         """
         Send the official-format buddy relay (0x2021) to the target.
         Handles both invitation (41b payload / 45b packet) and status update (56b payload / 60b packet).
@@ -136,10 +139,11 @@ class TunnelingManager:
         target_key = (target_id or "").lower()
         target_session = self.server.user_sessions.get(target_key)
         if not target_session:
-            # Save for offline delivery
-            return await self._save_offline_tunnel(
-                sender_client.user_id, target_id, 0x2021, payload
-            )
+            if allow_offline_store:
+                return await self._save_offline_tunnel(
+                    sender_client.user_id, target_id, 0x2021, payload
+                )
+            return False
 
         try:
             out_pkt = PacketBuilder(SVC_RELAY_BUDDY_REQ)
@@ -238,6 +242,10 @@ class TunnelingManager:
     async def _save_offline_tunnel(self, sender_id, target_id, packet_id, payload):
         """Salva pacote tunelado como mensagem offline."""
         try:
+            if packet_id not in self.OFFLINE_ALLOWED_PACKETS:
+                logger.debug(f"[OFFLINE SKIP] Not persisting packet 0x{packet_id:04X} ({sender_id} -> {target_id})")
+                return False
+
             body_hex = payload.hex()
             
             success = self.server.db.save_packet(
@@ -293,15 +301,15 @@ class TunnelingManager:
                     payload = body_hex.encode('latin1')
                 
                 payload = self._sanitize_payload(packet_id, payload)
-                
-                if packet_id == BUDDY_REQUEST_TO_CLIENT:
-                    raw = struct.pack('>H', 4 + len(payload)) + struct.pack('<H', packet_id) + payload
-                    client.writer.write(raw)
-                    await client.writer.drain()
-                else:
-                    out_pkt = PacketBuilder(packet_id)
-                    out_pkt.buffer = bytearray(payload)
-                    await client.send_packet(out_pkt.build())
+
+                if packet_id not in self.OFFLINE_ALLOWED_PACKETS:
+                    logger.warning(f"[TUNNEL DELIVERY] Dropping unsupported offline packet 0x{packet_id:04X} (Serial={pkt_data.get('SerialNo')})")
+                    self.server.db.delete_packet(pkt_data['SerialNo'])
+                    continue
+
+                out_pkt = PacketBuilder(packet_id)
+                out_pkt.buffer = bytearray(payload)
+                await client.send_packet(out_pkt.build())
                 
                 self.server.db.delete_packet(pkt_data['SerialNo'])
                 

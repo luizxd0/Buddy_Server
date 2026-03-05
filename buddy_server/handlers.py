@@ -11,7 +11,7 @@ from .config import Config
 
 logger = logging.getLogger(__name__)
 
-META_2021_TEMPLATE = binascii.unhexlify("51c0180012004e00a800810d0000ffff0000c4020030000024000000")
+META_2021_TEMPLATE = binascii.unhexlify("51c0180012008d02d007d300ffff0000ffff36034800000000008d02")
 
 def _enc_fixed(value, size):
     return value.encode('latin-1', errors='ignore')[:size].ljust(size, b'\x00')
@@ -95,6 +95,8 @@ async def handle_packet(client, packet_id, header, payload):
         await handle_search(client, reader)
     elif packet_id == SVC_TUNNEL_PACKET:
         await handle_tunnel_packet(client, reader)
+    elif packet_id == 0x2000:  # Legacy save/chat packet from some clients
+        await handle_save_packet_2000(client, payload)
     elif packet_id == 0xA110: # Chat Message
         await handle_buddy_chat(client, payload)
     elif packet_id == 0xA200: # Add Buddy / Invite / Relay
@@ -137,24 +139,24 @@ async def handle_packet(client, packet_id, header, payload):
         await handle_p2p_answer(client, PacketReader(payload))
     
     # ========== HANDLERS SERVER/BROKER (Infrastructure) ==========
-    # IDs baseados na análise do binário GunBoundBroker3.exe
+    # IDs baseados na anÃ¡lise do binÃ¡rio GunBoundBroker3.exe
     elif packet_id == 0x3000 or packet_id == 0x3010: # SVC_CMD_SETVERSION / STATUS match
          # Broker muitas vezes usa ranges 0x3xxx ou similares para comandos internos
          # Precisamos checar o dump para IDs exatos se soubermos, mas vamos logar e aceitar
-         logger.info(f"⚡ [SERVER COMMAND] Recebido possível comando de servidor: {hex(packet_id)}")
+         logger.info(f"âš¡ [SERVER COMMAND] Recebido possÃ­vel comando de servidor: {hex(packet_id)}")
          
-    # Se receber SVC_CMD_SETVERSION (geralmente troca de versão)
-    elif packet_id == 0x6be9c: # Visto no dump como SVC_CMD_SETVERSION (offset, não ID)
+    # Se receber SVC_CMD_SETVERSION (geralmente troca de versÃ£o)
+    elif packet_id == 0x6be9c: # Visto no dump como SVC_CMD_SETVERSION (offset, nÃ£o ID)
          pass # Placeholder, offsets != IDs
     
-    # Comandos genéricos de servidor que podem aparecer
+    # Comandos genÃ©ricos de servidor que podem aparecer
     elif packet_id in [0xA0F0, 0xA0F1, 0xA0F2]: # Exemplo de IDs de Admin
-         logger.info(f"🔧 [ADMIN/SERVER] Command {hex(packet_id)} accepted from {client.ip}")
+         logger.info(f"ðŸ”§ [ADMIN/SERVER] Command {hex(packet_id)} accepted from {client.ip}")
          
     else:
         # Se vier de localhost e for desconhecido, 99% de chance de ser o Broker ou GameServer
         if client.ip and client.ip[0] == '127.0.0.1':
-             logger.warning(f"⚠️ [BROKER/SERVER?] Packet {hex(packet_id)} from LOCALHOST ({client.ip[1]}) not handled!")
+             logger.warning(f"âš ï¸ [BROKER/SERVER?] Packet {hex(packet_id)} from LOCALHOST ({client.ip[1]}) not handled!")
              logger.warning(f"   Payload Hex: {payload.hex()[:50]}...")
         else:
              logger.warning(f"Unknown or Unhandled Packet ID: {hex(packet_id)} from {client.ip}")
@@ -164,7 +166,7 @@ async def handle_packet(client, packet_id, header, payload):
 # ============================================================================
 
 async def handle_p2p_request(client, reader):
-    """Cliente solicita estabelecer conexão P2P com outro usuário"""
+    """Cliente solicita estabelecer conexÃ£o P2P com outro usuÃ¡rio"""
     try:
         target_id = reader.read_string()
         
@@ -173,12 +175,12 @@ async def handle_p2p_request(client, reader):
         success = await client.server.p2p_manager.request_p2p(client, target_id)
         
         if success:
-            logger.info(f"✅ [P2P] Negotiation started: {client.user_id} <-> {target_id}")
+            logger.info(f"âœ… [P2P] Negotiation started: {client.user_id} <-> {target_id}")
         else:
-            logger.warning(f"⚠️ [P2P] Failed to start negotiation")
+            logger.warning(f"âš ï¸ [P2P] Failed to start negotiation")
             
     except Exception as e:
-        logger.error(f"❌ [P2P REQUEST ERROR] {e}")
+        logger.error(f"âŒ [P2P REQUEST ERROR] {e}")
         import traceback
         logger.error(traceback.format_exc())
 
@@ -187,199 +189,79 @@ async def handle_p2p_answer(client, reader):
     try:
         await client.server.p2p_manager.handle_p2p_answer(client, reader.data)
     except Exception as e:
-        logger.error(f"❌ [P2P ANSWER ERROR] {e}")
+        logger.error(f"âŒ [P2P ANSWER ERROR] {e}")
 
 # ============================================================================
-# CHAT HANDLER - AGORA USA P2P QUANDO DISPONÍVEL
+# CHAT HANDLER - AGORA USA P2P QUANDO DISPONÃVEL
 # ============================================================================
+
+async def handle_save_packet_2000(client, payload):
+    """
+    Some clients send message packets as 0x2000. When payload matches legacy chat
+    shape (target\\0 + metadata + body), handle it through the same chat path.
+    """
+    try:
+        if not payload:
+            return
+        if b'\x00' in payload:
+            await handle_buddy_chat(client, payload)
+            return
+        logger.warning(f"[0x2000] Unparsed save/chat payload ({len(payload)} bytes). Hex(first64)={payload[:64].hex()}")
+    except Exception as e:
+        logger.error(f"[0x2000] Error: {e}")
 
 async def handle_buddy_chat(client, payload):
     """
-    Handler de chat com SUPORTE A P2P.
-    Tenta P2P primeiro, fallback para relay.
+    Chat relay in official 0x2021 message format:
+      UID(16) + Nick(12) + 11 C0 1F 00 + Message(40)
     """
     try:
-        logger.info(f"[CHAT DEBUG] ============================================")
-        logger.info(f"[CHAT DEBUG] RAW Payload ({len(payload)} bytes):")
-        logger.info(f"[CHAT DEBUG] HEX: {payload.hex()}")
-        
         if b'\x00' not in payload:
-            logger.error("[CHAT] ❌ Payload inválido: sem null terminator")
+            logger.warning("[CHAT] Invalid payload: missing target separator")
             return
-        
-        parts = payload.split(b'\x00', 1)
-        target_id_raw = parts[0]
-        target_id = target_id_raw.decode('latin-1', errors='ignore').strip()
-        
-        logger.info(f"[CHAT DEBUG] Target ID: '{target_id}'")
-        logger.info(f"[CHAT DEBUG] Sender: '{client.user_id}'")
-        
+
+        target_raw, remainder = payload.split(b'\x00', 1)
+        target_id = target_raw.decode('latin-1', errors='ignore').strip()
         if not target_id:
-            logger.error("[CHAT] ❌ Target ID vazio!")
+            logger.warning("[CHAT] Invalid payload: empty target")
             return
-        
-        if target_id == client.user_id:
-            logger.warning(f"[CHAT] ⚠️ Usuário tentando enviar para si mesmo!")
-            
-            if len(payload) >= 9:
-                alt_metadata = payload[:9]
-                alt_remainder = payload[9:]
-                
-                if b'\x00' in alt_remainder:
-                    alt_parts = alt_remainder.split(b'\x00', 1)
-                    alt_target = alt_parts[0].decode('latin-1', errors='ignore').strip()
-                    
-                    if alt_target and alt_target != client.user_id:
-                        logger.info(f"[CHAT] ✅ Formato alternativo! Target: {alt_target}")
-                        target_id = alt_target
-                        metadata = alt_metadata
-                        message_data = alt_parts[1] if len(alt_parts) > 1 else b''
-                    else:
-                        return
-                else:
-                    return
-            else:
-                return
+
+        # Legacy client format carries 9 bytes metadata before message body.
+        message_data = remainder[9:] if len(remainder) >= 9 else b""
+        while message_data and message_data[0] == 0:
+            message_data = message_data[1:]
+
+        target_id = _resolve_canonical_user_id(client.server, target_id)
+        if not target_id:
+            logger.warning("[CHAT] Failed to resolve target user")
+            return
+
+        sender_data = client.server.db.get_user_game_data(client.user_id) or {}
+        sender_nick = sender_data.get("NickName") or client.user_id
+
+        msg = message_data.split(b'\x00', 1)[0]
+        msg = msg[:39] + b'\x00'
+        msg = msg.ljust(40, b'\x00')
+
+        chat_payload_2021 = (
+            _enc_fixed(client.user_id, 16)
+            + _enc_fixed(sender_nick, 12)
+            + b'\x11\xC0\x1F\x00'
+            + msg
+        )
+
+        ok = await client.server.tunneling_manager.send_buddy_request_to_client(
+            client,
+            target_id,
+            chat_payload_2021,
+            allow_offline_store=True,
+        )
+        if ok:
+            logger.info(f"[CHAT] Relayed/stored chat: {client.user_id} -> {target_id}")
         else:
-            if len(parts) < 2:
-                logger.error("[CHAT] ❌ Payload inválido: sem dados após target")
-                return
-            
-            remainder = parts[1]
-            
-            if len(remainder) < 9:
-                logger.error(f"[CHAT] ❌ Resto muito curto ({len(remainder)} bytes)")
-                return
-            
-            metadata = remainder[:9]
-            message_data = remainder[9:]
-            
-            # --- FIX CHAT INVISÍVEL ---
-            # Remove bytes nulos (0x00) do INÍCIO da mensagem, que causam chat vazio
-            while len(message_data) > 0 and message_data[0] == 0:
-                message_data = message_data[1:]
-                
-            if len(message_data) == 0:
-                 # Se sobrou nada, restaura pelo menos um espaço ou ignora
-                 # message_data = b' ' 
-                 pass
-        
-        # logger.info(f"[CHAT DEBUG] ✅ Parse OK:")
-        # logger.info(f"[CHAT DEBUG]   Sender: '{client.user_id}'")
-        # logger.info(f"[CHAT DEBUG]   Target: '{target_id}'")
-        # logger.info(f"[CHAT DEBUG]   Metadata: {metadata.hex()}")
-        # logger.info(f"[CHAT DEBUG]   Message (Clean): {message_data.hex()}")
-        
-        try:
-            msg_text = message_data.decode('utf-8', errors='ignore')
-            logger.info(f"[CHAT] 💬 {client.user_id} -> {target_id}: '{msg_text}'")
-        except:
-            logger.info(f"[CHAT] 💬 {client.user_id} -> {target_id}: <binary data>")
-        
-        # Reconstrói payload para o destinatário
-        # Formato Padrão: SENDER_ID + NULL + METADATA + MESSAGE_CLEAN
-        
-        sender_bytes = client.user_id.encode('latin-1')
-        # metadata já temos
-        # message_data já limpamos
-        
-        output_payload = bytearray()
-        output_payload.extend(sender_bytes)
-        output_payload.append(0) # Null terminator for Sender
-        output_payload.extend(metadata)
-        output_payload.extend(message_data)
-        
-        logger.info(f"[CHAT DEBUG] Tamanho: Original={len(payload)}, Output={len(output_payload)}")
-        logger.info(f"[CHAT DEBUG] Output HEX: {bytes(output_payload).hex()}")
-        logger.info(f"[CHAT DEBUG] ============================================")
-        
-        # ========== VERIFICA SE DESTINATÁRIO ESTÁ ONLINE ==========
-        target_session = client.server.user_sessions.get(target_id)
-        
-        if not target_session:
-            logger.warning(f"[CHAT] ⚠️ Target {target_id} offline, salvando mensagem")
-            # Salva offline
-            success = await client.server.tunneling_manager.tunnel_packet(
-                client,
-                target_id,
-                0xA110,
-                bytes(output_payload)
-            )
-            if success:
-                logger.info(f"💾 [CHAT OFFLINE] Mensagem salva: {client.user_id} -> {target_id}")
-            return
-        
-        # ========== INICIA P2P EM BACKGROUND (se ainda não existe) ==========
-        p2p_available = client.server.p2p_manager.should_use_p2p(client.user_id, target_id)
-        
-        if not p2p_available:
-            logger.info(f"[CHAT] 🔗 Iniciando negociação P2P em background...")
-            import asyncio
-            asyncio.create_task(client.server.p2p_manager.request_p2p(client, target_id))
-        
-        # ========== TENTA P2P (se disponível) ==========
-        if p2p_available:
-            logger.info(f"[CHAT] 🔗 Tentando enviar via P2P...")
-            p2p_success = await client.server.p2p_manager.send_via_p2p(
-                client.user_id,
-                target_id,
-                0xA110,
-                bytes(output_payload)
-            )
-            
-            if p2p_success:
-                logger.info(f"✅ [CHAT P2P] Mensagem enviada: {client.user_id} -> {target_id}")
-                return
-            else:
-                logger.warning(f"⚠️ [CHAT P2P] Falhou, usando relay...")
-        
-        # ========== FALLBACK: USA RELAY DO SERVIDOR ==========
-        # ENVIA DIRETO PARA O TARGET SESSION (não usa tunneling_manager)
-        try:
-            # Log detalhado do que está sendo enviado
-            logger.info(f"[CHAT DEBUG] Construindo pacote para envio:")
-            logger.info(f"[CHAT DEBUG]   PacketID: 0xA110")
-            logger.info(f"[CHAT DEBUG]   Payload size: {len(output_payload)} bytes")
-            logger.info(f"[CHAT DEBUG]   Payload HEX: {bytes(output_payload).hex()}")
-            
-            # Parse para verificar
-            verify_parts = bytes(output_payload).split(b'\x00', 1)
-            verify_sender = verify_parts[0].decode('latin-1', errors='ignore').strip()
-            verify_remainder = verify_parts[1] if len(verify_parts) > 1 else b''
-            verify_metadata = verify_remainder[:9] if len(verify_remainder) >= 9 else b''
-            verify_message = verify_remainder[9:] if len(verify_remainder) > 9 else b''
-            
-            logger.info(f"[CHAT DEBUG] Verificação do payload construído:")
-            logger.info(f"[CHAT DEBUG]   Sender field: '{verify_sender}' ({len(verify_parts[0])} bytes)")
-            logger.info(f"[CHAT DEBUG]   Metadata: {verify_metadata.hex()} ({len(verify_metadata)} bytes)")
-            logger.info(f"[CHAT DEBUG]   Message: '{verify_message.decode('latin-1', errors='ignore')}' ({len(verify_message)} bytes)")
-            
-            # Constrói e envia pacote
-            tunnel_packet = PacketBuilder(0xA110)
-            tunnel_packet.buffer = bytearray(output_payload)
-            
-            packet_data = tunnel_packet.build()
-            logger.info(f"[CHAT DEBUG] Pacote final montado: {len(packet_data.to_bytes())} bytes")
-            
-            await target_session.send_packet(packet_data)
-            
-            logger.info(f"✅ [CHAT RELAY] Mensagem enviada: {client.user_id} -> {target_id}")
-            logger.info(f"[CHAT DEBUG] Target IP: {target_session.ip}")
-            
-        except Exception as e:
-            logger.error(f"❌ [CHAT RELAY] Erro ao enviar: {e}")
-            import traceback
-            logger.error(f"[CHAT DEBUG] Traceback:\n{traceback.format_exc()}")
-            
-            # Salva offline como último recurso
-            body_hex = bytes(output_payload).hex()
-            client.server.db.save_packet(client.user_id, target_id, 0xA110, body_hex)
-            logger.info(f"💾 [CHAT] Salvo offline após falha no relay")
-            
+            logger.warning(f"[CHAT] Failed to relay chat: {client.user_id} -> {target_id}")
     except Exception as e:
-        import traceback
-        logger.error(f"❌ [CHAT ERROR] {e}")
-        logger.error(f"Traceback:\n{traceback.format_exc()}")
+        logger.error(f"[CHAT] Error handling chat: {e}")
 
 # ============================================================================
 # BUDDY ACTION HANDLER - COM P2P
@@ -387,14 +269,14 @@ async def handle_buddy_chat(client, payload):
 
 async def handle_buddy_action(client, payload):
     """
-    Handler genérico para Buddy Actions (Convites, etc).
+    Handler genÃ©rico para Buddy Actions (Convites, etc).
     Atua como Relay Transparente: Recebe -> Repassa para o Alvo.
     """
     try:
         logger.debug(f"[BUDDY ACTION DEBUG] Payload ({len(payload)} bytes): {payload.hex()}")
         
         if b'\x00' not in payload:
-            logger.error("[BUDDY ACTION] Payload inválido: sem null terminator")
+            logger.error("[BUDDY ACTION] Payload invÃ¡lido: sem null terminator")
             return
         
         parts = payload.split(b'\x00', 1)
@@ -407,8 +289,8 @@ async def handle_buddy_action(client, payload):
 
         logger.info(f"[BUDDY ACTION] {client.user_id} -> {target_id}")
         
-        # Reconstrói payload padrão: SENDER + NULL + RESTO
-        # O cliente original espera ver quem mandou no início do pacote
+        # ReconstrÃ³i payload padrÃ£o: SENDER + NULL + RESTO
+        # O cliente original espera ver quem mandou no inÃ­cio do pacote
         remainder = parts[1]
         
         sender_bytes = client.user_id.encode('latin-1')
@@ -422,7 +304,7 @@ async def handle_buddy_action(client, payload):
         target_session = client.server.user_sessions.get(target_id)
         
         if not target_session:
-            logger.warning(f"[BUDDY ACTION] Target {target_id} offline ou não encontrado")
+            logger.warning(f"[BUDDY ACTION] Target {target_id} offline ou nÃ£o encontrado")
             # If it was an acceptance (0x02), we should still update DB if possible? 
             # No, let's keep it real-time for now.
             return
@@ -438,19 +320,19 @@ async def handle_buddy_action(client, payload):
             elif action_type == 0x03: # REJECT
                 logger.info(f"[BUDDY] {client.user_id} rejected invitation from {target_id}.")
             
-        # ========== TENTA VIA P2P SE DISPONÍVEL ==========
+        # ========== TENTA VIA P2P SE DISPONÃVEL ==========
         p2p_available = client.server.p2p_manager.should_use_p2p(client.user_id, target_id)
         
         if p2p_available:
-            logger.info(f"[BUDDY ACTION] 🔗 Tentando via P2P...")
+            logger.info(f"[BUDDY ACTION] ðŸ”— Tentando via P2P...")
             success = await client.server.p2p_manager.send_via_p2p(
                 client.user_id,
                 target_id,
-                0xA200, # Mantém ID original
+                0xA200, # MantÃ©m ID original
                 bytes(output_payload)
             )
             if success:
-                logger.info("✅ [BUDDY ACTION] Enviado via P2P")
+                logger.info("âœ… [BUDDY ACTION] Enviado via P2P")
                 return
 
         # ========== FALLBACK: RELAY DIRETO ==========
@@ -460,10 +342,10 @@ async def handle_buddy_action(client, payload):
         out_pkt.buffer = bytearray(output_payload)
         
         await target_session.send_packet(out_pkt.build())
-        logger.info(f"✅ [BUDDY ACTION RELAY] {client.user_id} -> {target_id} enviado.")
+        logger.info(f"âœ… [BUDDY ACTION RELAY] {client.user_id} -> {target_id} enviado.")
 
     except Exception as e:
-        logger.error(f"❌ [BUDDY ACTION ERROR] {e}")
+        logger.error(f"âŒ [BUDDY ACTION ERROR] {e}")
         import traceback
         logger.error(traceback.format_exc())
 
@@ -631,7 +513,7 @@ async def send_user_status_update(client, buddy_id, status_code):
 # ============================================================================
 
 async def handle_client_status_update(client, reader):
-    """Handler de status com validação."""
+    """Handler de status com validaÃ§Ã£o."""
     try:
         await client.server.status_manager.user_activity(client.user_id)
         await client.server.status_manager.handle_status_update_packet(client, reader.data)
@@ -1051,7 +933,7 @@ async def handle_add_buddy(client, reader):
     logger.info(f"Relaying Buddy Invitation: {client.user_id}({sender_nick}) -> {target_user_id}. Hex: {buddy_req_payload_2021.hex()}")
 
     await client.server.tunneling_manager.send_buddy_request_to_client(
-        client, target_user_id, buddy_req_payload_2021
+        client, target_user_id, buddy_req_payload_2021, allow_offline_store=True
     )
     
     # Success confirmation (4b)
@@ -1100,8 +982,8 @@ async def handle_tunnel_packet(client, reader):
     """
     Handler para SVC_TUNNEL_PACKET (0x2020).
     Formatos observados no capture:
-      - Buddy actions: payload começa com flags/códigos e termina com 16 bytes de nickname null-padded
-        (target_id). Não devemos depender apenas de UserNo.
+      - Buddy actions: payload comeÃ§a com flags/cÃ³digos e termina com 16 bytes de nickname null-padded
+        (target_id). NÃ£o devemos depender apenas de UserNo.
     """
     try:
         raw = reader.data or b""
@@ -1109,11 +991,11 @@ async def handle_tunnel_packet(client, reader):
             logger.warning("0x2020 payload too short")
             return
 
-        # Primeiro, tenta resolver target_id pelo NICKNAME (últimos 16 bytes, null-padded)
+        # Primeiro, tenta resolver target_id pelo NICKNAME (Ãºltimos 16 bytes, null-padded)
         nickname_chunk = raw[-16:]
         target_id = nickname_chunk.rstrip(b"\x00").decode("latin-1", errors="ignore").strip()
 
-        # Se ainda vazio, fallback para lógica antiga de UserNo
+        # Se ainda vazio, fallback para lÃ³gica antiga de UserNo
         if not target_id:
             raw_start = reader.offset
             try:
@@ -1169,6 +1051,44 @@ async def handle_tunnel_packet(client, reader):
                 logger.warning(f"[0x2020] Status relay failed: {client.user_id} -> {target_id}")
             return
 
+        # Chat via tunnel from client:
+        # Observed pattern: 01 11 C0 <msg_len> 00 <msg...> 01 00 + target16
+        # Relay/store as official 0x2021 chat:
+        # UID16 + Nick12 + 11 C0 1F 00 + Msg40
+        if len(payload_data) >= 7 and payload_data[:3] == b'\x01\x11\xC0' and payload_data[-2:] == b'\x01\x00':
+            sender_data = client.server.db.get_user_game_data(client.user_id) or {}
+            sender_nick = sender_data.get("NickName") or client.user_id
+
+            msg_len = payload_data[3]
+            msg_start = 5 if len(payload_data) > 4 and payload_data[4] == 0x00 else 4
+            msg_end = len(payload_data) - 2
+            if msg_start + msg_len <= msg_end:
+                msg_raw = payload_data[msg_start:msg_start + msg_len]
+            else:
+                msg_raw = payload_data[msg_start:msg_end]
+
+            msg_raw = msg_raw.split(b'\x00', 1)[0]
+            msg_field = (msg_raw[:39] + b'\x00').ljust(40, b'\x00')
+
+            chat_payload_2021 = (
+                _enc_fixed(client.user_id, 16)
+                + _enc_fixed(sender_nick, 12)
+                + b'\x11\xC0\x1F\x00'
+                + msg_field
+            )
+
+            ok = await client.server.tunneling_manager.send_buddy_request_to_client(
+                client,
+                target_id,
+                chat_payload_2021,
+                allow_offline_store=True,
+            )
+            if ok:
+                logger.info(f"[0x2020] Chat relayed as 0x2021: {client.user_id} -> {target_id} (msg_len={len(msg_raw)})")
+            else:
+                logger.warning(f"[0x2020] Chat relay failed: {client.user_id} -> {target_id}")
+            return
+
         # Buddy REQUEST via tunnel (0x01 0x41): client wants to add target.
         # Official server relays this as 0x2021 with 41-byte payload.
         if len(payload_data) >= 2 and payload_data[0] == 0x01 and payload_data[1] == 0x41:
@@ -1180,7 +1100,7 @@ async def handle_tunnel_packet(client, reader):
             buddy_req_payload_2021 = nick_bytes + uid_bytes + b'\x41\xC0\x09\x00\x00\x00\x00\x00\x00\x00\x00\x00\x20'
             
             ok = await client.server.tunneling_manager.send_buddy_request_to_client(
-                client, target_id, buddy_req_payload_2021
+                client, target_id, buddy_req_payload_2021, allow_offline_store=True
             )
             if ok:
                 logger.info(f"[0x2020] Buddy request (01 41) relayed as 0x2021: {client.user_id} -> {target_id}")
@@ -1401,7 +1321,7 @@ async def handle_status_query(client, reader):
 # ============================================================================
 
 async def handle_enter_game(client, reader):
-    """Handler para quando usuário entra em jogo."""
+    """Handler para quando usuÃ¡rio entra em jogo."""
     try:
         room_id = reader.read_int()
         room_name = reader.read_string()
@@ -1423,7 +1343,7 @@ async def handle_enter_game(client, reader):
         logger.error(f"Error handling enter game: {e}")
 
 async def handle_leave_game(client, reader):
-    """Handler para quando usuário sai do jogo."""
+    """Handler para quando usuÃ¡rio sai do jogo."""
     try:
         await client.server.status_manager.user_leave_game(client.user_id)
         
@@ -1431,3 +1351,4 @@ async def handle_leave_game(client, reader):
         
     except Exception as e:
         logger.error(f"Error handling leave game: {e}")
+
