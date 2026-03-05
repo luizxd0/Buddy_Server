@@ -1,0 +1,156 @@
+No.     Time           Source                Destination           Protocol Length Info
+     69 3.848436200    192.168.1.121         217.196.60.115        TCP      105    64902 → 8352 [PSH, ACK] Seq=1 Ack=1 Win=27611 Len=51
+
+Frame 69: Packet, 105 bytes on wire (840 bits), 105 bytes captured (840 bits) on interface \Device\NPF_{5ADEEC52-1B48-46DD-AE0A-40D5C3C32A51}, id 0
+Ethernet II, Src: GigaByteTech_ff:b8:00 (d8:5e:d3:ff:b8:00), Dst: TendaTechnol_64:63:e0 (e8:65:d4:64:63:e0)
+Internet Protocol Version 4, Src: 192.168.1.121, Dst: 217.196.60.115
+Transmission Control Protocol, Src Port: 64902, Dst Port: 8352, Seq: 1, Ack: 1, Len: 51
+    Source Port: 64902
+    Destination Port: 8352
+    [Stream index: 3]
+    [Stream Packet Number: 1]
+    [Conversation completeness: Incomplete (12)]
+    [TCP Segment Len: 51]
+    Sequence Number: 1    (relative sequence number)
+    Sequence Number (raw): 2287290125
+    [Next Sequence Number: 52    (relative sequence number)]
+    Acknowledgment Number: 1    (relative ack number)
+    Acknowledgment number (raw): 3364788576
+    0101 .... = Header Length: 20 bytes (5)
+    Flags: 0x018 (PSH, ACK)
+    Window: 27611
+    [Calculated window size: 27611]
+    [Window size scaling factor: -1 (unknown)]
+    Checksum: 0xd8a6 [unverified]
+    [Checksum Status: Unverified]
+    Urgent Pointer: 0
+    [Timestamps]
+    [Client Contiguous Streams: 0]
+    [Server Contiguous Streams: 1]
+    TCP payload (51 bytes)
+Data (51 bytes)
+
+3.848436200
+0000  e8 65 d4 64 63 e0 d8 5e d3 ff b8 00 08 00 45 00   .e.dc..^......E.
+0010  00 5b 62 fa 40 00 80 06 00 00 c0 a8 01 79 d9 c4   .[b.@........y..
+0020  3c 73 fd 86 20 a0 88 55 47 0d c8 8e 99 60 50 18   <s.. ..UG....`P.
+0030  6b db d8 a6 00 00 33 00 20 20 00 51 c0 18 00 12   k.....3.  .Q....
+0040  00 4b 03 58 15 4b 03 00 00 ff ff 00 00 c4 02 ec   .K.X.K..........
+0050  ab 75 0f 64 bf 1a 00 01 00 74 65 73 74 65 72 61   .u.d.....testera
+0060  00 00 00 00 00 00 00 00 00                        .........
+
+No.     Time           Source                Destination           Protocol Length Info
+     74 4.084631600    217.196.60.115        192.168.1.121         TCP      60     8352 → 64902 [ACK] Seq=1 Ack=52 Win=502 Len=0
+
+Frame 74: Packet, 60 bytes on wire (480 bits), 60 bytes captured (480 bits) on interface \Device\NPF_{5ADEEC52-1B48-46DD-AE0A-40D5C3C32A51}, id 0
+Ethernet II, Src: TendaTechnol_64:63:e0 (e8:65:d4:64:63:e0), Dst: GigaByteTech_ff:b8:00 (d8:5e:d3:ff:b8:00)
+Internet Protocol Version 4, Src: 217.196.60.115, Dst: 192.168.1.121
+Transmission Control Protocol, Src Port: 8352, Dst Port: 64902, Seq: 1, Ack: 52, Len: 0
+    Source Port: 8352
+    Destination Port: 64902
+    [Stream index: 3]
+    [Stream Packet Number: 2]
+    [Conversation completeness: Incomplete (12)]
+    [TCP Segment Len: 0]
+    Sequence Number: 1    (relative sequence number)
+    Sequence Number (raw): 3364788576
+    [Next Sequence Number: 1    (relative sequence number)]
+    Acknowledgment Number: 52    (relative ack number)
+    Acknowledgment number (raw): 2287290176
+    0101 .... = Header Length: 20 bytes (5)
+    Flags: 0x010 (ACK)
+    Window: 502
+    [Calculated window size: 502]
+    [Window size scaling factor: -1 (unknown)]
+    Checksum: 0x85d9 [unverified]
+    [Checksum Status: Unverified]
+    Urgent Pointer: 0
+    [Timestamps]
+    [SEQ/ACK analysis]
+    [Client Contiguous Streams: 1]
+    [Server Contiguous Streams: 0]
+
+4.084631600
+0000  d8 5e d3 ff b8 00 e8 65 d4 64 63 e0 08 00 45 00   .^.....e.dc...E.
+0010  00 28 6e c1 40 00 34 06 ff b5 d9 c4 3c 73 c0 a8   .(n.@.4.....<s..
+0020  01 79 20 a0 fd 86 c8 8e 99 60 88 55 47 40 50 10   .y ......`.UG@P.
+0030  01 f6 85 d9 00 00 d2 7c 20 20 20 20               .......|    
+
+No.     Time           Source                Destination           Protocol Length Info
+     75 4.146631600    217.196.60.115        192.168.1.121         TCP      114    8352 → 59577 [PSH, ACK] Seq=1 Ack=1 Win=502 Len=60
+
+Frame 75: Packet, 114 bytes on wire (912 bits), 114 bytes captured (912 bits) on interface \Device\NPF_{5ADEEC52-1B48-46DD-AE0A-40D5C3C32A51}, id 0
+Ethernet II, Src: TendaTechnol_64:63:e0 (e8:65:d4:64:63:e0), Dst: GigaByteTech_ff:b8:00 (d8:5e:d3:ff:b8:00)
+Internet Protocol Version 4, Src: 217.196.60.115, Dst: 192.168.1.121
+Transmission Control Protocol, Src Port: 8352, Dst Port: 59577, Seq: 1, Ack: 1, Len: 60
+    Source Port: 8352
+    Destination Port: 59577
+    [Stream index: 4]
+    [Stream Packet Number: 1]
+    [Conversation completeness: Incomplete (12)]
+    [TCP Segment Len: 60]
+    Sequence Number: 1    (relative sequence number)
+    Sequence Number (raw): 1130016999
+    [Next Sequence Number: 61    (relative sequence number)]
+    Acknowledgment Number: 1    (relative ack number)
+    Acknowledgment number (raw): 3067609076
+    0101 .... = Header Length: 20 bytes (5)
+    Flags: 0x018 (PSH, ACK)
+    Window: 502
+    [Calculated window size: 502]
+    [Window size scaling factor: -1 (unknown)]
+    Checksum: 0x05ab [unverified]
+    [Checksum Status: Unverified]
+    Urgent Pointer: 0
+    [Timestamps]
+    [Client Contiguous Streams: 0]
+    [Server Contiguous Streams: 1]
+    TCP payload (60 bytes)
+Data (60 bytes)
+
+4.146631600
+0000  d8 5e d3 ff b8 00 e8 65 d4 64 63 e0 08 00 45 00   .^.....e.dc...E.
+0010  00 64 85 6a 40 00 34 06 e8 d0 d9 c4 3c 73 c0 a8   .d.j@.4.....<s..
+0020  01 79 20 a0 e8 b9 43 5a b0 e7 b6 d7 ff f4 50 18   .y ...CZ......P.
+0030  01 f6 05 ab 00 00 3c 00 21 20 74 65 73 74 00 00   ......<.! test..
+0040  00 00 00 00 00 00 00 00 00 00 54 65 73 74 00 00   ..........Test..
+0050  00 00 00 00 00 00 51 c0 18 00 12 00 4b 03 58 15   ......Q.....K.X.
+0060  4b 03 00 00 ff ff 00 00 c4 02 ec ab 75 0f 64 bf   K...........u.d.
+0070  1a 00                                             ..
+
+No.     Time           Source                Destination           Protocol Length Info
+     78 4.190936700    192.168.1.121         217.196.60.115        TCP      54     59577 → 8352 [ACK] Seq=1 Ack=61 Win=27881 Len=0
+
+Frame 78: Packet, 54 bytes on wire (432 bits), 54 bytes captured (432 bits) on interface \Device\NPF_{5ADEEC52-1B48-46DD-AE0A-40D5C3C32A51}, id 0
+Ethernet II, Src: GigaByteTech_ff:b8:00 (d8:5e:d3:ff:b8:00), Dst: TendaTechnol_64:63:e0 (e8:65:d4:64:63:e0)
+Internet Protocol Version 4, Src: 192.168.1.121, Dst: 217.196.60.115
+Transmission Control Protocol, Src Port: 59577, Dst Port: 8352, Seq: 1, Ack: 61, Len: 0
+    Source Port: 59577
+    Destination Port: 8352
+    [Stream index: 4]
+    [Stream Packet Number: 2]
+    [Conversation completeness: Incomplete (12)]
+    [TCP Segment Len: 0]
+    Sequence Number: 1    (relative sequence number)
+    Sequence Number (raw): 3067609076
+    [Next Sequence Number: 1    (relative sequence number)]
+    Acknowledgment Number: 61    (relative ack number)
+    Acknowledgment number (raw): 1130017059
+    0101 .... = Header Length: 20 bytes (5)
+    Flags: 0x010 (ACK)
+    Window: 27881
+    [Calculated window size: 27881]
+    [Window size scaling factor: -1 (unknown)]
+    Checksum: 0xd873 [unverified]
+    [Checksum Status: Unverified]
+    Urgent Pointer: 0
+    [Timestamps]
+    [SEQ/ACK analysis]
+    [Client Contiguous Streams: 1]
+    [Server Contiguous Streams: 0]
+
+4.190936700
+0000  e8 65 d4 64 63 e0 d8 5e d3 ff b8 00 08 00 45 00   .e.dc..^......E.
+0010  00 28 62 fb 40 00 80 06 00 00 c0 a8 01 79 d9 c4   .(b.@........y..
+0020  3c 73 e8 b9 20 a0 b6 d7 ff f4 43 5a b1 23 50 10   <s.. .....CZ.#P.
+0030  6c e9 d8 73 00 00                                 l..s..

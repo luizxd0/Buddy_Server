@@ -7,7 +7,6 @@ from .database import Database
 from .config import Config
 from .constants import *
 from .crypto import GBCrypto
-from .center_client import BuddyCenterClient
 from datetime import datetime
 
 # ========== IMPORTAR NOVOS MANAGERS ==========
@@ -51,6 +50,8 @@ class ClientConnection:
         self.user_id = None
         self.is_authenticated = False
         self.state = 0
+        # 4-byte auth token sent in 0x1001 (Java game server sends this; client may use it for 0x1010 dynamic encrypt)
+        self.auth_token = None
 
     async def send_packet(self, packet):
         try:
@@ -71,7 +72,7 @@ class ClientConnection:
                 if not block_data:
                     break
                 
-                logger.info(f"RAW RECEIVED (16 bytes): {block_data.hex().upper()}") 
+                logger.info(f"RAW RECEIVED ({len(block_data)} bytes): {block_data.hex().upper()}") 
                 if self.ip:
                     tracer.log("IN", self.ip[0], self.ip[1], block_data)
                 
@@ -112,11 +113,17 @@ class ClientConnection:
                 decrypted_remaining = b""
                 
                 if is_plaintext:
-                    needed = packet_len - 16
+                    # Use actual bytes received so payload in same or next TCP segment is read
+                    needed = packet_len - len(block_data)
+                    # Thor's Hammer / GBS: when we have more than 4 bytes but header says length=4,
+                    # use full received block as one packet (payload = rest of block)
+                    if needed <= 0 and packet_len == 4 and len(block_data) > 4:
+                        packet_len = len(block_data)
+                        needed = 0
                     if needed > 0:
                         remaining_data = await self.reader.readexactly(needed)
                         if self.ip:
-                             tracer.log("IN", self.ip[0], self.ip[1], remaining_data)
+                            tracer.log("IN", self.ip[0], self.ip[1], remaining_data)
                     
                 else:
                     wire_size = packet_len
@@ -161,11 +168,6 @@ class ClientConnection:
             except Exception as e:
                 logger.error(f"Error updating status on disconnect: {e}")
             
-            try:
-                if self.server.center_client:
-                    await self.server.center_client.notify_user_logout(self.user_id)
-            except Exception as e:
-                logger.error(f"Error notifying center on disconnect: {e}")
         
         try:
             self.writer.close()
@@ -185,9 +187,7 @@ class BuddyServer:
         self.clients = []
         
         # ========== MANAGERS ==========
-        self.center_client = BuddyCenterClient('127.0.0.1', 8339)
-        self.center_client.set_server(self)
-        
+        self.center_client = None  # BuddyCenter removed; run standalone only
         self.tunneling_manager = TunnelingManager(self)
         self.invite_manager = InviteManager(self)
         self.status_manager = UserStatusManager(self)
@@ -216,10 +216,6 @@ class BuddyServer:
         logger.info("Starting P2P Manager...")
         await self.p2p_manager.start()
         
-        # Conectar ao BuddyCenter
-        logger.info("Connecting to BuddyCenter...")
-        await self.center_client.connect()
-        
         # Iniciar Servidor TCP
         logger.info(f"Starting TCP Server on {Config.HOST}:{Config.PORT}...")
         self.server = await asyncio.start_server(
@@ -235,7 +231,7 @@ class BuddyServer:
         logger.info('✅ Invite Manager: Active')
         logger.info('✅ Status Manager: Active')
         logger.info('✅ P2P Manager: Active (NEW!)')
-        logger.info(f'{"✅" if self.center_client.connected else "⚠️"} BuddyCenter: {"Connected" if self.center_client.connected else "Standalone Mode"}')
+        logger.info('✅ BuddyCenter: Disabled (standalone only)')
         logger.info('='*60)
         logger.info('⏳ WAITING FOR GAME CLIENTS/SERVER CONNECTIONS...')
         logger.info('💡 P2P will be used automatically when available')
@@ -254,9 +250,9 @@ class BuddyServer:
         logger.info("Stopping managers...")
         await self.invite_manager.stop()
         await self.status_manager.stop()
-        await self.p2p_manager.stop()  # NOVO
-        await self.center_client.disconnect()
-        
+        await self.p2p_manager.stop()
+        if self.center_client:
+            await self.center_client.disconnect()
         if self.server:
             self.server.close()
             await self.server.wait_closed()
@@ -272,12 +268,13 @@ class BuddyServer:
         asyncio.create_task(client.run())
 
     def register_user(self, user_id, client):
-        self.user_sessions[user_id] = client
+        self.user_sessions[user_id.lower()] = client
         logger.info(f"✓ User {user_id} registered active session.")
 
     def unregister_user(self, user_id):
-        if user_id in self.user_sessions:
-            del self.user_sessions[user_id]
+        uid_lower = user_id.lower()
+        if uid_lower in self.user_sessions:
+            del self.user_sessions[uid_lower]
             logger.info(f"✗ User {user_id} session unregistered.")
 
     def remove_client(self, client):
@@ -296,7 +293,7 @@ class BuddyServer:
                 'total_connections': len(self.clients),
                 'uptime': 0
             },
-            'center': self.center_client.get_stats() if self.center_client else {},
+            'center': {},
             'tunneling': self.tunneling_manager.get_stats(),
             'invites': self.invite_manager.get_stats(),
             'status': self.status_manager.get_stats(),

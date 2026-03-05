@@ -330,7 +330,7 @@ class InviteManager:
         """Envia informações para conectar ao jogo"""
         pkt = PacketBuilder(0xB000)  # GAME_JOIN_INFO
         pkt.write_string(game_data.get('server_ip', '127.0.0.1'))
-        pkt.write_int(game_data.get('server_port', 8372))
+        pkt.write_int(game_data.get('server_port', 8400))
         pkt.write_int(game_data.get('room_id', 0))
         pkt.write_string(game_data.get('room_name', 'Game'))
         

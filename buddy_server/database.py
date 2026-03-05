@@ -11,50 +11,122 @@ class Database:
         try:
             self.connection = mysql.connector.connect(**self.db_config)
             if self.connection.is_connected():
-                self.connection.autocommit = True  # Enable autocommit
+                self.connection.autocommit = True
                 print("Database connected successfully")
                 return True
         except Error as e:
             print(f"Error connecting to MySQL: {e}")
             return False
-            if self.connection.is_connected():
-                print("Connected to MySQL database")
-        except Error as e:
-            print(f"Error while connecting to MySQL: {e}")
+
+    def _ensure_connection(self):
+        """Ensures the MySQL connection is alive, reconnecting if needed."""
+        try:
+            if not self.connection or not self.connection.is_connected():
+                self.connect()
+            else:
+                self.connection.ping(reconnect=True, attempts=3, delay=1)
+        except Error:
+            print("Refreshing lost MySQL connection...")
+            try:
+                if self.connection:
+                    self.connection.close()
+            except:
+                pass
+            self.connect()
 
     def disconnect(self):
         if self.connection and self.connection.is_connected():
             self.connection.close()
             print("MySQL connection is closed")
 
-    def get_user_game_data(self, user_id):
+    def get_user_game_data(self, user_id_or_nickname):
         """
-        Fetches the complete game header for a user.
-        Based on binary analysis:
-        SELECT Guild, TotalGrade, SeasonGrade, MemberCount, TotalRank, SeasonRank, GuildRank, 
-        AccumShot, AccumDamage, TotalScore, SeasonScore, Money, EventScore0, EventScore1, ...
-        FROM Game WHERE Id='%s'
+        Fetches user info and game data. Join to get numeric Id (UserNo).
         """
+        self._ensure_connection()
         cursor = self.connection.cursor(dictionary=True)
         query = """
-            SELECT Guild, TotalGrade, SeasonGrade, MemberCount, TotalRank, SeasonRank, GuildRank, 
-                   AccumShot, AccumDamage, TotalScore, SeasonScore, Money, 
-                   EventScore0, EventScore1, EventScore2, EventScore3, 
-                   Country, CountryGrade, CountryRank 
-            FROM Game WHERE Id = %s
+            SELECT u.Id AS UserNo, g.UserId, g.NickName, g.TotalGrade, g.TotalRank, g.Guild
+            FROM game g
+            INNER JOIN user u ON u.UserId = g.UserId
+            WHERE g.UserId = %s OR g.NickName = %s
         """
-        cursor.execute(query, (user_id,))
-        result = cursor.fetchone()
-        cursor.close()
-        return result
+        try:
+            cursor.execute(query, (user_id_or_nickname, user_id_or_nickname))
+            return cursor.fetchone()
+        except Error:
+            return None
+        finally:
+            cursor.close()
+
+    def get_user_game_data_by_id(self, user_no):
+        """Fetches game data by numeric user Id."""
+        self._ensure_connection()
+        cursor = self.connection.cursor(dictionary=True)
+        query = """
+            SELECT u.UserId, g.NickName, g.Gold, g.Cash, g.TotalGrade
+            FROM user u
+            LEFT JOIN game g ON u.UserId = g.UserId
+            WHERE u.Id = %s
+        """
+        try:
+            cursor.execute(query, (user_no,))
+            return cursor.fetchone()
+        except Error:
+            return None
+        finally:
+            cursor.close()
+
+    def get_users_with_passwords(self):
+        """Return list of (UserId, Password) for users that have a game row (for dynamic-key login try)."""
+        cursor = self.connection.cursor(dictionary=True)
+        try:
+            cursor.execute(
+                "SELECT u.UserId, u.Password FROM user u INNER JOIN game g ON g.UserId = u.UserId"
+            )
+            return [(r["UserId"], r["Password"]) for r in cursor.fetchall() or []]
+        except Error:
+            return []
+        finally:
+            cursor.close()
+
+    def get_all_game_user_identifiers(self):
+        """Return list of (UserId, NickName) for all game rows (for 0x1010 SHA1 digest match)."""
+        cursor = self.connection.cursor(dictionary=True)
+        try:
+            cursor.execute("SELECT UserId, NickName FROM game")
+            return [(r["UserId"], (r.get("NickName") or r.get("Nickname") or r["UserId"])) for r in cursor.fetchall() or []]
+        except Error:
+            return []
+        finally:
+            cursor.close()
 
     def get_user_by_nickname(self, nickname):
+        """Resolve nickname to user id. sql_th: game.NickName -> user.Id, user.UserId."""
         cursor = self.connection.cursor(dictionary=True)
-        query = "SELECT Id, Nickname FROM User WHERE Nickname = %s"
-        cursor.execute(query, (nickname,))
-        result = cursor.fetchone()
-        cursor.close()
-        return result
+        try:
+            # Join game and user to get both internal numeric ID and string UserId
+            query = """
+                SELECT u.Id as UserNo, u.UserId, g.NickName 
+                FROM game g
+                INNER JOIN user u ON u.UserId = g.UserId
+                WHERE g.NickName = %s
+            """
+            cursor.execute(query, (nickname,))
+            result = cursor.fetchone()
+            if result:
+                # Return standardized dict that include both IDs
+                return {
+                    'Id': result['UserId'],     # String login ID
+                    'UserNo': result['UserNo'], # Numeric internal ID
+                    'UserId': result['UserId'], # String login ID (duplicate key for safety)
+                    'NickName': result['NickName']
+                }
+        except Error as e:
+            print(f"Error fetching user by nickname: {e}")
+        finally:
+            cursor.close()
+        return None
 
     def resolve_user_id(self, login_name):
         """
@@ -63,26 +135,16 @@ class Database:
         """
         cursor = self.connection.cursor(dictionary=True)
         try:
-            # 1. Try treating login_name as the ID (if Id is valid)
-            # But we know BuddyList expects Int.
-            # So maybe 'Id' in User is NOT the login name, but the numeric ID?
-            # And there is another column for login?
-            
-            # Let's try to find a user where 'Id' (as string) matches, OR 'Login' matches.
-            # Since we don't know column names, let's try 'Id' first.
-            # If 'Id' is INT, querying WHERE Id='teste' will fail or implicit cast to 0.
-            
-            # SAFE QUERY: Check columns first? Too slow.
-            # Let's try to fetch by Nickname first, assuming Login ~= Nickname for 'teste'.
-            query = "SELECT Id FROM User WHERE Nickname = %s"
+            # First try matching by literal UserId
+            query = "SELECT Id FROM user WHERE UserId = %s"
             cursor.execute(query, (login_name,))
             res = cursor.fetchone()
             if res:
                 return res['Id']
 
-            # Try by 'Login' column
+            # Then try matching by game NickName
             try:
-                query_login = "SELECT Id FROM User WHERE Login = %s"
+                query_login = "SELECT u.Id FROM user u INNER JOIN game g ON g.UserId = u.UserId WHERE g.NickName = %s"
                 cursor.execute(query_login, (login_name,))
                 res = cursor.fetchone()
                 if res:
@@ -147,26 +209,40 @@ class Database:
     # ID MAPPING (Login String <-> UserNo Int)
     # -------------------------------------------------------------------------
     def get_userno(self, login_id):
-        """Converts Login ID (String) to UserNo (Int)."""
+        """Converts Login ID (UserId string) to numeric Id. Supports sql_th: user.Id, user.UserId."""
+        self._ensure_connection()
         cursor = self.connection.cursor()
-        # Assuming 'Id' is the login column and 'N' is the numeric ID based on debug output.
-        query = "SELECT N FROM User WHERE Id = %s" 
-        cursor.execute(query, (login_id,))
-        res = cursor.fetchone()
-        cursor.close()
-        if res:
-            return res[0]
+        try:
+            cursor.execute("SELECT Id FROM user WHERE UserId = %s", (login_id,))
+            res = cursor.fetchone()
+            if res:
+                return res[0]
+        except Error:
+            pass
+        try:
+            cursor.execute("SELECT u.Id FROM user u INNER JOIN game g ON g.UserId = u.UserId WHERE g.NickName = %s", (login_id,))
+            res = cursor.fetchone()
+            if res:
+                return res[0]
+        except Error:
+            pass
+        finally:
+            cursor.close()
         return None
 
     def get_login_id(self, userno):
-        """Converts UserNo (Int) to Login ID (String)."""
+        """Converts numeric Id to Login ID (UserId string)."""
+        self._ensure_connection()
         cursor = self.connection.cursor()
-        query = "SELECT Id FROM User WHERE N = %s"
-        cursor.execute(query, (userno,))
-        res = cursor.fetchone()
-        cursor.close()
-        if res:
-            return res[0]
+        try:
+            cursor.execute("SELECT UserId FROM user WHERE Id = %s", (userno,))
+            res = cursor.fetchone()
+            if res:
+                return res[0]
+        except Error:
+            pass
+        finally:
+            cursor.close()
         return str(userno)
 
     # -------------------------------------------------------------------------
@@ -226,6 +302,7 @@ class Database:
         Legacy wrapper for backward compatibility.
         Returns list of dicts: [{'friend_id': 'login'}, ...]
         """
+        self._ensure_connection()
         full_list = self.get_full_buddy_list(user_id)
         # Convert to old format
         simple_list = []
@@ -237,31 +314,26 @@ class Database:
 
     def get_full_buddy_list(self, user_id):
         """
-        Retrieves the complete buddy list with details using a single JOIN query.
-        Matches binary behavior: 
-        SELECT u.Nickname, b.Category, u.Id
-        FROM User AS u 
-        INNER JOIN BuddyList AS b ON u.N = b.Buddy 
-        WHERE b.Id = (SELECT N FROM User WHERE Id = %s)
+        Retrieves the complete buddy list. sql_th: BuddyList.Id/Buddy = user.Id; friend Id/Nickname from user + game.
         """
+        self._ensure_connection()
+        u_no = self.get_userno(user_id)
+        if not u_no:
+            return []
         cursor = self.connection.cursor(dictionary=True)
         try:
-            # First, get the UserNo (N) for the requester
-            u_no = self.get_userno(user_id)
-            if not u_no:
-                return []
-                
-            # Now fetch friends joining User table to get Nicknames directly
-            # Assuming 'b.Buddy' is the UserNo of the friend
+            # sql_th: user.Id, user.UserId; game.NickName (column name in schema); BuddyList.Id=owner, Buddy=friend
             query = """
-                SELECT u.Id, u.Nickname, b.Category 
-                FROM User AS u 
-                INNER JOIN BuddyList AS b ON u.N = b.Buddy 
+                SELECT u.UserId AS Id, u.Id AS UserNo, COALESCE(g.NickName, u.UserId) AS NickName, 
+                       g.TotalGrade, g.TotalRank, g.Guild, b.Category
+                FROM BuddyList b
+                INNER JOIN user u ON u.Id = b.Buddy
+                LEFT JOIN game g ON g.UserId = u.UserId
                 WHERE b.Id = %s
             """
             cursor.execute(query, (u_no,))
             results = cursor.fetchall()
-            return results
+            return results if results is not None else []
         except Error as e:
             print(f"Error fetching full buddy list: {e}")
             return []
@@ -269,21 +341,31 @@ class Database:
             cursor.close()
 
     def get_users_info(self, user_ids):
-        # Deprecated logic kept for fallback, but get_full_buddy_list is preferred
-        if not user_ids: return []
+        """Return list of {Id, NickName} for given UserIds (login names). sql_th: game.NickName."""
+        if not user_ids:
+            return []
         format_strings = ','.join(['%s'] * len(user_ids))
         cursor = self.connection.cursor(dictionary=True)
-        query = f"SELECT Id, Nickname FROM User WHERE Id IN ({format_strings})"
-        cursor.execute(query, tuple(user_ids))
-        res = cursor.fetchall()
-        cursor.close()
-        return res
+        try:
+            query = f"""
+                SELECT u.UserId AS Id, COALESCE(g.NickName, u.UserId) AS NickName
+                FROM user u LEFT JOIN game g ON g.UserId = u.UserId
+                WHERE u.UserId IN ({format_strings})
+            """
+            cursor.execute(query, tuple(user_ids))
+            return cursor.fetchall() or []
+        except Error as e:
+            print(f"Error checking users info: {e}")
+            return []
+        finally:
+            cursor.close()
 
     # -------------------------------------------------------------------------
     # OFFLINE PACKET HANDLING (Analyzed from BuddyServ2)
     # -------------------------------------------------------------------------
     
     def save_packet(self, sender_id, receiver_id, code, body):
+        self._ensure_connection()
         print(f"[DEBUG] save_packet called: sender={sender_id}, receiver={receiver_id}, code={hex(code)}")
         
         # Packet/OfflineMsg likely uses Ints too based on logs.
@@ -314,6 +396,7 @@ class Database:
             return False
 
     def get_packets(self, receiver_id):
+        self._ensure_connection()
         r_no = self.get_userno(receiver_id)
         print(f"DEBUG: Checking offline packets for {receiver_id} (UserNo: {r_no})")
         if not r_no:
@@ -344,6 +427,7 @@ class Database:
         """
         Deletes a specific packet after delivery.
         """
+        self._ensure_connection()
         cursor = self.connection.cursor()
         try:
             query = "DELETE FROM Packet WHERE SerialNo = %s"
@@ -362,6 +446,7 @@ class Database:
         Moves a friend to a different category/group.
         Query: UPDATE BuddyList SET Category='%s' WHERE Id='%s' AND Buddy='%s'
         """
+        self._ensure_connection()
         cursor = self.connection.cursor()
         try:
             query = "UPDATE BuddyList SET Category = %s WHERE Id = %s AND Buddy = %s"
@@ -395,12 +480,16 @@ class Database:
     def get_user_by_search_term(self, term):
         """
         Searches for a user by Nickname OR Phone Number.
-        Binary string: DB] DBIN_ID_FROM_PHONE -> SELECT Id, Nickname FROM User WHERE Phone_number='%s'
         """
         cursor = self.connection.cursor(dictionary=True)
-        # Try finding by Nickname first
-        query = "SELECT Id, Nickname FROM User WHERE Nickname = %s"
-        cursor.execute(query, (term,))
+        # Try finding by Nickname first joining with game
+        query = """
+            SELECT u.UserId as Id, g.NickName 
+            FROM user u
+            INNER JOIN game g ON u.UserId = g.UserId
+            WHERE g.NickName = %s OR u.UserId = %s
+        """
+        cursor.execute(query, (term, term))
         res = cursor.fetchone()
         
         if not res:

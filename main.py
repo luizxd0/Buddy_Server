@@ -202,7 +202,7 @@ class ServerGUI:
         text_handler.setFormatter(formatter)
         
         logger = logging.getLogger()
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging.DEBUG)
         logger.handlers = []  # Clear existing handlers
         logger.addHandler(text_handler)
 

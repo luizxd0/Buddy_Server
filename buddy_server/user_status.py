@@ -1,11 +1,13 @@
 import asyncio
 import logging
 import time
+import struct
+import binascii
 from enum import IntEnum
 from typing import Dict, Set, Optional
 
 from .packets import PacketBuilder
-from .constants import SVC_USER_STATE
+from .constants import *
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +36,7 @@ class UserStatusManager:
     
     # Packet IDs
     PKT_STATUS_UPDATE = 0xA510      # Cliente envia update
-    PKT_STATUS_BROADCAST = 0x3010   # Servidor broadcast para amigos
+    PKT_STATUS_BROADCAST = 0x3011   # Servidor broadcast para amigos (was 0x3010, caused collision)
     PKT_STATUS_QUERY = 0xA511       # Cliente pergunta status
     PKT_STATUS_RESPONSE = 0xA512    # Resposta de query
     
@@ -86,6 +88,40 @@ class UserStatusManager:
     def get_status_data(self, user_id: str) -> dict:
         """Retorna dados adicionais do status"""
         return self.user_status_data.get(user_id, {})
+        
+    def get_gunbound_status_bitmask(self, user_id: str) -> int:
+        """
+        Converte UserStatus e metadados para o bitmask de 2 bytes (short) do GunBound.
+        
+        Bitmask (visto em referências de emulação):
+        - Bit 0: Online?
+        - Bit 1: Busy?
+        - Bit 4: In Game?
+        - Outros bits podem representar ChannelID (bits 8-15?)
+        
+        Mapeamento comum:
+        - 18 (0x0012) = Online (Bit 1 + Bit 4?)
+        - 0 = Offline
+        """
+        status = self.get_status(user_id)
+        data = self.get_status_data(user_id)
+        
+        if status == UserStatus.OFFLINE:
+            return 0
+            
+        # Base online status (usually 0x0012 or similar)
+        # Vamos usar 0x0012 como base e ajustar
+        bitmask = 0x0012
+        
+        if status == UserStatus.IN_GAME:
+            bitmask |= 0x0004 # Exemplo bit de jogo
+            
+        # Adiciona Channel/World info se disponível nos dados
+        # world_id = data.get('world_id', 0)
+        # channel_id = data.get('channel_id', 0)
+        # bitmask |= (channel_id << 8)
+        
+        return bitmask
     
     async def set_status(self, user_id: str, new_status: UserStatus, 
                         data: dict = None, broadcast: bool = True):
@@ -128,10 +164,6 @@ class UserStatusManager:
         # Notifica amigos
         if broadcast:
             await self._broadcast_status_change(user_id, new_status, data)
-        
-        # Notifica BuddyCenter
-        if self.server.center_client and self.server.center_client.connected:
-            await self.server.center_client.notify_user_state_change(user_id, new_status)
         
         return True
     
@@ -220,23 +252,44 @@ class UserStatusManager:
         if not buddies:
             return
         
-        friend_ids = [b.get('friend_id') for b in buddies]
+        friend_ids = [b.get('FriendId') or b.get('friend_id') or b.get('Id') for b in buddies]
+        friend_ids = [fid for fid in friend_ids if fid]
         
         # Para cada amigo online, envia notificação
         for friend_id in friend_ids:
-            friend_session = self.server.user_sessions.get(friend_id)
+            uid_lower = friend_id.lower()
+            friend_session = self.server.user_sessions.get(uid_lower)
             
             if friend_session:
                 try:
-                    pkt = PacketBuilder(self.PKT_STATUS_BROADCAST)
-                    pkt.write_string(user_id)
-                    pkt.write_byte(new_status.value)
+                    # 0x2021 (SVC_RELAY_BUDDY_REQ) - 60 bytes total
+                    # Layout: Nick(16) + Nick(16) + UserNo(4) + Status(2) + Rank(2) + MetaPad(16)
+                    buddy_data = self.server.db.get_user_game_data(user_id) or {}
+                    nick_val = buddy_data.get('NickName') or user_id
                     
-                    # Dados extras
-                    if new_status == UserStatus.IN_GAME and data:
-                        pkt.write_string(data.get('room_name', 'Game'))
+                    status = self.get_gunbound_status_bitmask(user_id)
+                    rank = int(buddy_data.get('TotalGrade') or 0)
+                    user_no = int(buddy_data.get('UserNo') or 0)
+                    guild_name = buddy_data.get('Guild') or ""
+
+                    uid_b = user_id.encode('latin-1', errors='ignore')[:15].ljust(16, b'\x00')
+                    nick_b = nick_val.encode('latin-1', errors='ignore')[:15].ljust(16, b'\x00')
+                    guild_b = guild_name.encode('latin-1', errors='ignore')[:7].ljust(8, b'\x00')
+
+                    # Metadata 24 bytes (index 4=Status, index 18=UserNo, index 20=Rank)
+                    meta = bytearray(24)
+                    struct.pack_into('<H', meta, 4, status)
+                    struct.pack_into('<H', meta, 18, user_no & 0xFFFF)
+                    struct.pack_into('<H', meta, 20, rank)
+
+                    relay_upd = PacketBuilder(SVC_RELAY_BUDDY_REQ)
+                    relay_upd.write_bytes(uid_b)
+                    relay_upd.write_bytes(nick_b)
+                    relay_upd.write_bytes(bytes(meta))
                     
-                    await friend_session.send_packet(pkt.build())
+                    await friend_session.send_packet(relay_upd.build())
+                    
+                    logger.info(f"Broadcasted Status (0x2021): UID={user_id}, Status={hex(status)}, Guild='{guild_name}'")
                     self.stats['broadcasts_sent'] += 1
                     
                 except Exception as e:
@@ -250,14 +303,18 @@ class UserStatusManager:
         
         Estrutura (baseada em análise):
         UPDATE CurrentUser SET Context=%d, ServerIP=%s, ServerPort=%d WHERE Id=%s
+        ServerIP/ServerPort = game server address (where user is playing), NOT client IP.
+        Client IP is stored in LoginLog. Use 0.0.0.0 when not IN_GAME so it's clear they're in lobby.
         """
         try:
             cursor = self.server.db.connection.cursor()
-            
-            # Context = status code
-            # ServerIP/Port = onde está (se IN_GAME)
-            server_ip = data.get('server_ip', '127.0.0.1') if data else '127.0.0.1'
-            server_port = data.get('server_port', 8372) if data else 8372
+            # ServerIP/Port = game server only when IN_GAME; otherwise 0.0.0.0:0
+            if status == UserStatus.IN_GAME and data:
+                server_ip = data.get('server_ip', '127.0.0.1')
+                server_port = data.get('server_port', 8400)
+            else:
+                server_ip = '0.0.0.0'
+                server_port = 0
             
             # Verifica se já existe
             check_query = "SELECT Id FROM CurrentUser WHERE Id = %s"

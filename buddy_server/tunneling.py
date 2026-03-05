@@ -1,6 +1,7 @@
+import struct
 import logging
 from .packets import PacketBuilder, PacketReader
-from .constants import SVC_TUNNEL_PACKET
+from .constants import SVC_TUNNEL_PACKET, SVC_RELAY_BUDDY_REQ
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +64,10 @@ class TunnelingManager:
         # Sanitiza payload
         sanitized_payload = self._sanitize_payload(packet_id, payload)
         
-        # Tenta enviar para usuário online
+        # Tenta enviar para usuário online (user_sessions key = UserId string)
         target_session = self.server.user_sessions.get(target_id)
+        if packet_id == 0xA200:
+            logger.info(f"[TUNNEL 0xA200] target_id={target_id!r}, session_found={target_session is not None}, payload_len={len(sanitized_payload)}")
         
         if target_session:
             try:
@@ -84,6 +87,9 @@ class TunnelingManager:
                 
                 self.tunnel_stats['successful'] += 1
                 logger.info(f"[TUNNEL] {sender_client.user_id} -> {target_id} (0x{packet_id:04X}) ✓")
+                if packet_id == 0xA200:
+                    raw = tunnel_packet.to_bytes()
+                    logger.info(f"[TUNNEL 0xA200] sent hex (first 64): {raw[:64].hex().upper()}")
                 
                 return True
                 
@@ -106,6 +112,10 @@ class TunnelingManager:
                         payload, retry_count + 1, max_retries
                     )
         
+        if packet_id == 0xA200:
+            logger.info(f"[TUNNEL 0xA200] Target {target_id} offline, skipping DB storage.")
+            return False
+
         # Usuário offline ou todas tentativas falharam - salva no banco
         return await self._save_offline_tunnel(
             sender_client.user_id, 
@@ -113,7 +123,34 @@ class TunnelingManager:
             packet_id, 
             sanitized_payload
         )
-    
+
+    async def send_buddy_request_to_client(self, sender_client, target_id, payload):
+        """
+        Send the official-format buddy relay (0x2021) to the target.
+        Handles both invitation (41b payload / 45b packet) and status update (56b payload / 60b packet).
+        """
+        if not sender_client.is_authenticated or sender_client.user_id == target_id:
+            return False
+            
+        target_session = self.server.user_sessions.get(target_id)
+        if not target_session:
+            # Save for offline delivery
+            return await self._save_offline_tunnel(
+                sender_client.user_id, target_id, 0x2021, payload
+            )
+
+        try:
+            out_pkt = PacketBuilder(SVC_RELAY_BUDDY_REQ)
+            out_pkt.write_bytes(payload)
+            
+            await target_session.send_packet(out_pkt.build())
+            self.tunnel_stats['successful'] += 1
+            logger.info(f"[0x2021] Buddy relay ({len(payload)}b) relayed: {sender_client.user_id} -> {target_id} ✓")
+            return True
+        except Exception as e:
+            logger.warning(f"[0x2021] Send failed: {e}")
+            return False
+
     def _validate_tunnel_request(self, sender_client, target_id, packet_id):
         """
         Valida se o tunelamento é permitido.
@@ -179,7 +216,11 @@ class TunnelingManager:
     def _build_tunnel_packet(self, sender_id, original_packet_id, payload):
         """Constrói pacote tunelado para envio."""
         tunnel_pkt = PacketBuilder(original_packet_id)
-        tunnel_pkt.buffer = bytearray(payload)
+        # In Gunbound, tunneled packets (relays) often use Null-terminated names.
+        # Pascal strings (write_string) cause issues if they contain \0 in the length prefix.
+        tunnel_pkt.write_bytes(sender_id.encode('latin-1', errors='ignore'))
+        tunnel_pkt.write_byte(0) # Null terminator
+        tunnel_pkt.write_bytes(payload)
         return tunnel_pkt.build()
     
     async def _is_connection_alive(self, client_session):
@@ -251,9 +292,14 @@ class TunnelingManager:
                 
                 payload = self._sanitize_payload(packet_id, payload)
                 
-                out_pkt = PacketBuilder(packet_id)
-                out_pkt.buffer = bytearray(payload)
-                await client.send_packet(out_pkt.build())
+                if packet_id == BUDDY_REQUEST_TO_CLIENT:
+                    raw = struct.pack('>H', 4 + len(payload)) + struct.pack('<H', packet_id) + payload
+                    client.writer.write(raw)
+                    await client.writer.drain()
+                else:
+                    out_pkt = PacketBuilder(packet_id)
+                    out_pkt.buffer = bytearray(payload)
+                    await client.send_packet(out_pkt.build())
                 
                 self.server.db.delete_packet(pkt_data['SerialNo'])
                 
@@ -273,7 +319,7 @@ class TunnelingManager:
             nick = user_id
             info = self.server.db.get_users_info([user_id])
             if info:
-                nick = info[0].get('Nickname', user_id)
+                nick = info[0].get('NickName') or info[0].get('Nickname', user_id)
             
             fake_list = PacketBuilder(0x1010)
             fake_list.write_byte(1)
