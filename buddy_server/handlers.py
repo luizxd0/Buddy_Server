@@ -122,6 +122,87 @@ def _was_recent_buddy_removal(server, user_a, user_b, window_seconds=8.0):
     del cache[key]
     return False
 
+
+def _mark_recent_buddy_request(server, sender_user_id, target_user_id):
+    if not sender_user_id or not target_user_id:
+        return
+    cache = getattr(server, "recent_buddy_requests", None)
+    if cache is None:
+        cache = {}
+        setattr(server, "recent_buddy_requests", cache)
+    now = time.time()
+    key = (sender_user_id.lower(), target_user_id.lower())
+    cache[key] = now
+    for k, ts in list(cache.items()):
+        if now - ts > 45.0:
+            del cache[k]
+
+
+def _was_recent_buddy_request(server, sender_user_id, target_user_id, window_seconds=30.0):
+    if not sender_user_id or not target_user_id:
+        return False
+    cache = getattr(server, "recent_buddy_requests", None)
+    if not cache:
+        return False
+    key = (sender_user_id.lower(), target_user_id.lower())
+    ts = cache.get(key)
+    if ts is None:
+        return False
+    if time.time() - ts <= window_seconds:
+        return True
+    del cache[key]
+    return False
+
+
+def _should_process_buddy_43(server, actor_user_id, target_user_id, window_seconds=1.0):
+    """
+    Throttle repeated ambiguous 0x43 actions from the same pair to avoid
+    delete/reject feedback loops and log storms.
+    """
+    if not actor_user_id or not target_user_id:
+        return True
+    cache = getattr(server, "recent_buddy_43", None)
+    if cache is None:
+        cache = {}
+        setattr(server, "recent_buddy_43", cache)
+
+    now = time.time()
+    key = (actor_user_id.lower(), target_user_id.lower())
+    ts = cache.get(key)
+    if ts is not None and (now - ts) <= window_seconds:
+        return False
+
+    cache[key] = now
+    for k, t in list(cache.items()):
+        if now - t > 10.0:
+            del cache[k]
+    return True
+
+
+def _should_emit_buddy_decision(server, actor_user_id, target_user_id, is_accept, window_seconds=2.0):
+    """
+    Deduplicate accept/reject popups emitted through multiple protocol paths
+    (commonly both 0x3000 and 0x2020 for the same user action).
+    """
+    if not actor_user_id or not target_user_id:
+        return True
+    cache = getattr(server, "recent_buddy_decisions", None)
+    if cache is None:
+        cache = {}
+        setattr(server, "recent_buddy_decisions", cache)
+
+    now = time.time()
+    key = (actor_user_id.lower(), target_user_id.lower(), 1 if is_accept else 0)
+    ts = cache.get(key)
+    if ts is not None and (now - ts) <= window_seconds:
+        return False
+
+    cache[key] = now
+    for k, t in list(cache.items()):
+        if now - t > 10.0:
+            del cache[k]
+    return True
+
 async def handle_packet(client, packet_id, header, payload):
     reader = PacketReader(payload)
     
@@ -429,6 +510,28 @@ async def _send_buddy_decision_popup(server, target_session, actor_user_id, is_a
     await target_session.send_packet(evt.build())
 
 
+async def _send_buddy_removed_popup(server, target_session, actor_user_id):
+    """
+    Send legacy short 0x2021 remove event expected by some clients to update
+    buddy UI immediately (without requiring world-list/channel reload).
+    Layout: UID(16) + Nick(12) + Marker(5)
+    Marker: 43 C0 01 00 01
+    """
+    try:
+        actor_data = server.db.get_user_game_data(actor_user_id) or {}
+        actor_uid = _enc_fixed(actor_user_id, 16)
+        actor_nick = _enc_fixed(actor_data.get('NickName') or actor_user_id, 12)
+        marker = b'\x43\xC0\x01\x00\x01'
+
+        evt = PacketBuilder(SVC_RELAY_BUDDY_REQ)
+        evt.write_bytes(actor_uid)
+        evt.write_bytes(actor_nick)
+        evt.write_bytes(marker)
+        await target_session.send_packet(evt.build())
+    except Exception as e:
+        logger.warning(f"[0x3002] Failed to send live remove popup to target: {e}")
+
+
 async def handle_buddy_accept_reject_3000(client, reader):
     """
     Official 0x3000: Recipient accepts/rejects. 
@@ -507,12 +610,15 @@ async def handle_buddy_accept_reject_3000(client, reader):
             
             if is_accept:
                 # Ensure requester gets the same accept popup used in 0x2020 accept path.
-                await _send_buddy_decision_popup(
-                    client.server,
-                    sender_session,
-                    client.user_id,
-                    is_accept=True,
-                )
+                if _should_emit_buddy_decision(client.server, client.user_id, target_id, True):
+                    await _send_buddy_decision_popup(
+                        client.server,
+                        sender_session,
+                        client.user_id,
+                        is_accept=True,
+                    )
+                else:
+                    logger.debug(f"[DEDUP] Suppressed duplicate accept popup: {client.user_id} -> {target_id}")
 
                 cached_meta = _get_cached_meta_2021(client.server, client.user_id)
                 meta = cached_meta if cached_meta else _build_meta_2021(0x0012)
@@ -522,12 +628,15 @@ async def handle_buddy_accept_reject_3000(client, reader):
                 evt.write_bytes(meta)
                 await sender_session.send_packet(evt.build())
             else:
-                await _send_buddy_decision_popup(
-                    client.server,
-                    sender_session,
-                    client.user_id,
-                    is_accept=False,
-                )
+                if _should_emit_buddy_decision(client.server, client.user_id, target_id, False):
+                    await _send_buddy_decision_popup(
+                        client.server,
+                        sender_session,
+                        client.user_id,
+                        is_accept=False,
+                    )
+                else:
+                    logger.debug(f"[DEDUP] Suppressed duplicate reject popup: {client.user_id} -> {target_id}")
             
             if is_accept:
                 # Also send the 0x3001 packet to ensure it appears in the list immediately
@@ -1051,6 +1160,7 @@ async def handle_add_buddy(client, reader):
     await client.server.tunneling_manager.send_buddy_request_to_client(
         client, target_user_id, buddy_req_payload_2021, allow_offline_store=True
     )
+    _mark_recent_buddy_request(client.server, client.user_id, target_user_id)
     
     # Success confirmation (4b)
     resp = PacketBuilder(SVC_ADD_BUDDY_RESP)
@@ -1065,49 +1175,64 @@ async def handle_add_buddy(client, reader):
     await client.send_packet(sync.build())
 
 async def handle_remove_buddy(client, reader):
-    if not client.is_authenticated or not client.user_id:
-        logger.warning(f"[0x3002] Ignored unauthenticated remove-buddy packet from {client.ip}")
-        return
+    try:
+        if not client.is_authenticated or not client.user_id:
+            logger.warning(f"[0x3002] Ignored unauthenticated remove-buddy packet from {client.ip}")
+            return
 
-    # Official server: 0x3002 body = 16-byte null-padded friend id (capture Len=20: 4 header + 16 body)
-    raw_payload = reader.data or b""
-    friend_id = ""
-    if raw_payload:
-        chunk = raw_payload[:16].rstrip(b"\x00")
-        if chunk:
-            friend_id = chunk.decode("utf-8", errors="ignore").strip()
+        # Official server: 0x3002 body = 16-byte null-padded friend id (capture Len=20: 4 header + 16 body)
+        raw_payload = reader.data or b""
+        friend_id = ""
+        if raw_payload:
+            chunk = raw_payload[:16].rstrip(b"\x00")
+            if chunk:
+                friend_id = chunk.decode("utf-8", errors="ignore").strip()
+            if not friend_id:
+                friend_id = raw_payload.split(b"\x00")[0].decode("utf-8", errors="ignore").strip()
+
         if not friend_id:
-            friend_id = raw_payload.split(b"\x00")[0].decode("utf-8", errors="ignore").strip()
+            logger.warning("Remove Buddy failed: could not parse friend id from 0x3002")
+            resp = PacketBuilder(SVC_REMOVE_BUDDY_RESP)
+            resp.write_int(0)
+            await client.send_packet(resp.build())
+            return
 
-    if not friend_id:
-        logger.warning("Remove Buddy failed: could not parse friend id from 0x3002")
+        # Normalize case/nickname variants and delete both relationship rows.
+        friend_id = _resolve_canonical_user_id(client.server, friend_id) or friend_id
+        # Some clients auto-send a mirrored 0x3002 after receiving the live remove popup.
+        # If the pair was just removed, acknowledge and stop here to prevent ping-pong loops.
+        if _was_recent_buddy_removal(client.server, client.user_id, friend_id, window_seconds=4.0):
+            logger.info(f"[0x3002] Duplicate remove suppressed: {client.user_id} -> {friend_id}")
+            resp = PacketBuilder(SVC_REMOVE_BUDDY_RESP)
+            resp.write_int(1)
+            resp.write_string(friend_id)
+            await client.send_packet(resp.build())
+            return
+
+        removed_a = client.server.db.remove_buddy(client.user_id, friend_id)
+        removed_b = client.server.db.remove_buddy(friend_id, client.user_id)
+        success = bool(removed_a or removed_b)
+
         resp = PacketBuilder(SVC_REMOVE_BUDDY_RESP)
-        resp.write_int(0)
+        if success:
+            resp.write_int(1)
+            resp.write_string(friend_id)
+            logger.info(f"Mutual buddy removed: {client.user_id} <-> {friend_id}")
+            _mark_recent_buddy_removal(client.server, client.user_id, friend_id)
+        else:
+            resp.write_int(0)
+
         await client.send_packet(resp.build())
-        return
 
-    # Normalize case/nickname variants and delete both relationship rows.
-    friend_id = _resolve_canonical_user_id(client.server, friend_id) or friend_id
-    removed_a = client.server.db.remove_buddy(client.user_id, friend_id)
-    removed_b = client.server.db.remove_buddy(friend_id, client.user_id)
-    success = bool(removed_a or removed_b)
-
-    resp = PacketBuilder(SVC_REMOVE_BUDDY_RESP)
-    if success:
-        resp.write_int(1)
-        resp.write_string(friend_id)
-        logger.info(f"Mutual buddy removed: {client.user_id} <-> {friend_id}")
-        _mark_recent_buddy_removal(client.server, client.user_id, friend_id)
-    else:
-        resp.write_int(0)
-
-    await client.send_packet(resp.build())
-
-    # Refresh buddy list instantly for both sides.
-    await send_friend_list(client)
-    target_session = _get_session_by_user_id(client.server, friend_id)
-    if target_session:
-        await send_friend_list(target_session)
+        # Refresh buddy list instantly for both sides.
+        await send_friend_list(client)
+        target_session = _get_session_by_user_id(client.server, friend_id)
+        if success and target_session:
+            # Push explicit remove event so target client updates UI immediately.
+            await _send_buddy_removed_popup(client.server, target_session, client.user_id)
+            await send_friend_list(target_session)
+    except Exception as e:
+        logger.error(f"[0x3002] Error handling remove buddy: {e}")
 
 async def handle_tunnel_packet(client, reader):
     """
@@ -1239,6 +1364,7 @@ async def handle_tunnel_packet(client, reader):
                 client, target_id, buddy_req_payload_2021, allow_offline_store=True
             )
             if ok:
+                _mark_recent_buddy_request(client.server, client.user_id, target_id)
                 logger.info(f"[0x2020] Buddy request (01 41) relayed as 0x2021: {client.user_id} -> {target_id}")
             return
         # Buddy decision parsing (critical):
@@ -1255,6 +1381,9 @@ async def handle_tunnel_packet(client, reader):
                 is_reject = True
         elif len(payload_data) >= 2 and payload_data[0] == 0x01 and payload_data[1] == 0x43:
             # 0x43 is ambiguous in captures: can be invite-reject OR delete follow-up.
+            if not _should_process_buddy_43(client.server, client.user_id, target_id):
+                logger.debug(f"[0x2020] Throttled duplicate 0x43 action: {client.user_id} -> {target_id}")
+                return
             if _was_recent_buddy_removal(client.server, client.user_id, target_id) or _users_are_buddies(client.server, client.user_id, target_id):
                 is_delete_action = True
             else:
@@ -1267,19 +1396,25 @@ async def handle_tunnel_packet(client, reader):
             target_session = _get_session_by_user_id(client.server, target_id)
             if target_session:
                 if is_accept:
-                    await _send_buddy_decision_popup(
-                        client.server,
-                        target_session,
-                        client.user_id,
-                        is_accept=True
-                    )
+                    if _should_emit_buddy_decision(client.server, client.user_id, target_id, True):
+                        await _send_buddy_decision_popup(
+                            client.server,
+                            target_session,
+                            client.user_id,
+                            is_accept=True
+                        )
+                    else:
+                        logger.debug(f"[DEDUP] Suppressed duplicate accept popup: {client.user_id} -> {target_id}")
                 else:
-                    await _send_buddy_decision_popup(
-                        client.server,
-                        target_session,
-                        client.user_id,
-                        is_accept=False
-                    )
+                    if _should_emit_buddy_decision(client.server, client.user_id, target_id, False):
+                        await _send_buddy_decision_popup(
+                            client.server,
+                            target_session,
+                            client.user_id,
+                            is_accept=False
+                        )
+                    else:
+                        logger.debug(f"[DEDUP] Suppressed duplicate reject popup: {client.user_id} -> {target_id}")
 
         if is_accept:
             # Update DB FIRST
@@ -1309,16 +1444,25 @@ async def handle_tunnel_packet(client, reader):
             await send_friend_list(client)
             return
         if is_delete_action:
+            # Suppress duplicate delete loops: some clients can emit repeated 0x01 0x43
+            # after receiving delete/not-found updates.
+            was_recent = _was_recent_buddy_removal(client.server, client.user_id, target_id, window_seconds=3.0)
             removed_a = client.server.db.remove_buddy(client.user_id, target_id)
             removed_b = client.server.db.remove_buddy(target_id, client.user_id)
             if removed_a or removed_b:
                 logger.info(f"[0x2020] Mutual buddy removed: {client.user_id} <-> {target_id}")
-            _mark_recent_buddy_removal(client.server, client.user_id, target_id)
+                _mark_recent_buddy_removal(client.server, client.user_id, target_id)
 
-            await send_friend_list(client)
-            target_session = _get_session_by_user_id(client.server, target_id)
-            if target_session:
-                await send_friend_list(target_session)
+                await send_friend_list(client)
+                target_session = _get_session_by_user_id(client.server, target_id)
+                if target_session:
+                    await send_friend_list(target_session)
+            else:
+                if was_recent:
+                    logger.debug(f"[0x2020] Duplicate delete suppressed: {client.user_id} -> {target_id}")
+                    return
+                logger.info(f"[0x2020] Delete action had no effect (already removed): {client.user_id} -> {target_id}")
+                _mark_recent_buddy_removal(client.server, client.user_id, target_id)
             return
         if is_reject:
             logger.info(f"[0x2020] Buddy invite rejected: {client.user_id} -> {target_id}")
