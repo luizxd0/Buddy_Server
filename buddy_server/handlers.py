@@ -567,7 +567,7 @@ async def handle_buddy_accept_reject_3000(client, reader):
                     action = 0x03
         
         if action is None:
-            logger.info(
+            logger.debug(
                 f"[0x3000] Ambiguous action for {client.user_id} -> '{target_name}' (no explicit 0x02/0x03). "
                 f"Ignoring 0x3000 to avoid false accept. Raw={raw.hex().upper()}"
             )
@@ -878,10 +878,6 @@ async def handle_login(client, reader):
     if not reader.has_data():
         # Align with Java game server: 0x1001 payload = 4-byte auth token (client uses it for 0x1010 key derivation)
         client.auth_token = os.urandom(4)
-        logger.info(
-            "Login 0x1000 with empty payload; sending 0x1001 with 4-byte auth token (Java-aligned). Token=%s (for RE: use with re_1010_login.py)",
-            client.auth_token.hex(),
-        )
         resp = PacketBuilder(SVC_LOGIN_RESP)
         resp.write_bytes(bytes(client.auth_token))
         await client.send_packet(resp.build())
@@ -1202,7 +1198,7 @@ async def handle_remove_buddy(client, reader):
         # Some clients auto-send a mirrored 0x3002 after receiving the live remove popup.
         # If the pair was just removed, acknowledge and stop here to prevent ping-pong loops.
         if _was_recent_buddy_removal(client.server, client.user_id, friend_id, window_seconds=4.0):
-            logger.info(f"[0x3002] Duplicate remove suppressed: {client.user_id} -> {friend_id}")
+            logger.debug(f"[0x3002] Duplicate remove suppressed: {client.user_id} -> {friend_id}")
             resp = PacketBuilder(SVC_REMOVE_BUDDY_RESP)
             resp.write_int(1)
             resp.write_string(friend_id)
@@ -1306,7 +1302,7 @@ async def handle_tunnel_packet(client, reader):
                 client, target_id, relay_payload
             )
             if ok:
-                logger.info(f"[0x2020] Status relay as 0x2021: {client.user_id} -> {target_id}")
+                logger.debug(f"[0x2020] Status relay as 0x2021: {client.user_id} -> {target_id}")
             else:
                 logger.warning(f"[0x2020] Status relay failed: {client.user_id} -> {target_id}")
             return
@@ -1344,7 +1340,7 @@ async def handle_tunnel_packet(client, reader):
                 allow_offline_store=True,
             )
             if ok:
-                logger.info(f"[0x2020] Chat relayed as 0x2021: {client.user_id} -> {target_id} (msg_len={len(msg_raw)})")
+                logger.debug(f"[0x2020] Chat relayed as 0x2021: {client.user_id} -> {target_id} (msg_len={len(msg_raw)})")
             else:
                 logger.warning(f"[0x2020] Chat relay failed: {client.user_id} -> {target_id}")
             return
@@ -1365,7 +1361,7 @@ async def handle_tunnel_packet(client, reader):
             )
             if ok:
                 _mark_recent_buddy_request(client.server, client.user_id, target_id)
-                logger.info(f"[0x2020] Buddy request (01 41) relayed as 0x2021: {client.user_id} -> {target_id}")
+                logger.debug(f"[0x2020] Buddy request (01 41) relayed as 0x2021: {client.user_id} -> {target_id}")
             return
         # Buddy decision parsing (critical):
         # Accept sample: 01 42 C0 01 00 01 ...
